@@ -3,14 +3,19 @@
 ## 1. What this project is
 
 The Meta Ads Marketing Command Center is an AI-powered paid media monitoring
-and reporting system built on top of the Meta Marketing API. The long-term
-goal is a command center that automatically collects Meta Ads performance
-data, cleans it, and (in later phases) analyzes it for anomalies and
-optimisation opportunities.
+and reporting system built on top of the Meta Marketing API. It has two
+layers today:
 
-**This repository currently contains only the first layer: data collection
-and data cleaning.** There is no AI analysis, anomaly detection, or
-dashboard yet -- those are separate, future phases.
+- **Layer 1 -- Data collection and cleaning** (`meta_collector.py`): pulls
+  campaign-level daily performance data from the Meta Marketing API into a
+  clean CSV.
+- **Layer 2 -- Performance analysis and executive reporting**
+  (`performance_analyzer.py` + `ai_analyst.py`): turns that CSV into
+  structured, rule-based findings, then asks Claude to turn those findings
+  into a concise executive report.
+
+There is still no dashboard or automated optimisation/bidding layer -- those
+remain out of scope for now.
 
 ## 2. What `meta_collector.py` does
 
@@ -36,14 +41,25 @@ recommendations -- that is intentionally out of scope for this phase.
 
 ```
 meta-ai-command-center/
-├── meta_collector.py       # Data collection + cleaning script (this phase)
+├── meta_collector.py         # Layer 1: data collection + cleaning
+├── performance_analyzer.py   # Layer 2: deterministic rule-based analysis engine
+├── ai_analyst.py              # Layer 2: AI executive report writer (Claude)
+├── validate_output.py         # Validates the collector's CSV output
+├── tests/
+│   └── test_performance_analyzer.py   # Unit tests for the rule engine
 ├── data/
-│   └── meta_campaign_daily.csv   # Generated output (not committed to git)
-├── config/                 # Reserved for future configuration files
+│   ├── meta_campaign_daily.csv        # Generated (not committed to git)
+│   └── performance_findings.json      # Generated (not committed to git)
+├── reports/
+│   └── meta_performance_report.md     # Generated (not committed to git)
+├── config/                    # Reserved for future configuration files
 ├── README.md
 ├── requirements.txt
 ├── .env.example
 └── .gitignore
+
+.github/workflows/
+└── meta-collector.yml         # Daily + on-demand pipeline (Layer 1 + Layer 2)
 ```
 
 The script is organized into small, single-purpose functions:
@@ -210,24 +226,246 @@ these columns:
 The access token is never written to this file, printed to the console, or
 logged anywhere.
 
-## 10. Running via GitHub Actions
+---
 
-The collector also runs automatically through
+# Layer 2 -- Performance Analysis & AI Executive Reporting
+
+Layer 2 turns the Layer 1 CSV into an executive-ready report in two strictly
+separated stages: a **deterministic analysis engine** that owns every number,
+and an **AI executive analyst** that only interprets and writes about numbers
+it's given.
+
+```
+Layer 1 output (data/meta_campaign_daily.csv)
+        │
+        ▼
+performance_analyzer.py   (deterministic -- no AI, no API calls)
+        │  last 7 days vs. previous 7 days, per campaign + account-wide
+        │  rule engine produces structured findings
+        ▼
+data/performance_findings.json
+        │
+        ▼
+ai_analyst.py   (calls the Anthropic API once)
+        │  interprets findings, writes FACT / SIGNAL / RECOMMENDATION report
+        ▼
+reports/meta_performance_report.md
+```
+
+## 10. Deterministic vs. AI responsibilities
+
+This split is deliberate and is the most important design decision in Layer 2:
+
+| | Deterministic engine (`performance_analyzer.py`) | AI analyst (`ai_analyst.py`) |
+|---|---|---|
+| Computes metrics and percentage changes | ✅ Yes -- the only source of truth | ❌ Never recalculates anything |
+| Decides which findings fire | ✅ Yes -- fixed, auditable rule thresholds | ❌ Cannot invent or suppress a finding |
+| Explains *why* something might be happening | ❌ No causal language at all | ✅ Yes, but only as a labeled SIGNAL, never a stated FACT |
+| Writes the executive summary / prioritization / recommended actions | ❌ No | ✅ Yes |
+| Calls an external API | ❌ No | ✅ Yes (Anthropic API, one call per run) |
+
+If `performance_analyzer.py` and `ai_analyst.py` ever disagree on a number,
+`performance_analyzer.py` is correct -- the AI is instructed to use the given
+JSON as-is and never to recompute or override it.
+
+## 11. `performance_analyzer.py` -- the analysis engine
+
+Reads `data/meta_campaign_daily.csv` and, per campaign and for the account as
+a whole:
+
+1. Determines a **last 7 days** window (the dataset's most recent date, and
+   the 6 days before it) and a **previous 7 days** window (the 7 days before
+   that), based on the data's own max date -- not today's date.
+2. Sums raw metrics (spend, impressions, clicks, purchases, purchase value,
+   add-to-carts, initiated checkouts) within each window, then derives ratio
+   metrics (CTR, CPC, CPM, CPA, ROAS, ATC rate, checkout rate,
+   checkout-to-purchase rate) from those sums -- never by averaging daily
+   ratios, which would misweight low-volume days.
+3. Computes the percentage change between the two windows for spend, CTR,
+   CPC, purchases, CPA, ROAS, add-to-carts, initiated checkouts, and
+   checkout-to-purchase rate, using `safe_pct_change()`: if the previous
+   value is zero or undefined, the change is `null`, never `inf` or `NaN`.
+4. Runs the seven rules below against each campaign's numbers.
+5. Sorts findings by severity (`critical` → `high` → `medium` → `positive`
+   → `low`), then by that campaign's last-7-day spend, descending.
+6. Writes everything -- metadata, an account-wide summary, and the sorted
+   findings -- to `data/performance_findings.json`.
+
+This script makes no network calls and does not require any API key.
+
+## 12. Performance rules (deterministic anomaly detection)
+
+| Rule | Category | Severity | Trigger |
+|---|---|---|---|
+| Wasted spend | `wasted_spend` | critical | Last 7-day spend ≥ 2,000 **and** last 7-day purchases = 0 |
+| CPA deterioration | `cost_increase` | high | Last & previous 7-day purchases both ≥ 3 **and** CPA increased ≥ 40% |
+| ROAS decline | `performance_decline` | high | Both periods have a defined ROAS **and** it declined ≥ 35% |
+| Funnel leakage | `funnel_issue` | high | Last 7-day initiated checkouts ≥ 20 **and** checkout-to-purchase rate < 5% |
+| Creative fatigue signal | `creative_fatigue` | medium | Spend increased ≥ 20% **and** CTR declined ≥ 20% -- reported explicitly as a possible signal, never a proven cause |
+| Scaling opportunity | `scaling_opportunity` | positive | Last 7-day purchases ≥ 5 **and** ROAS ≥ 2 **and** CPA improved ≥ 20% |
+| Tracking risk | `tracking_risk` | high | Last 7-day purchases > 0 **and** last 7-day purchase value = 0 |
+
+Every finding carries `finding_id`, `campaign_id`, `campaign_name`,
+`severity`, `category`, `title`, `observation`, `evidence` (the exact numbers
+that triggered it), and `recommended_action`. Rules are pure functions in
+`performance_analyzer.py` and are covered by `tests/test_performance_analyzer.py`.
+
+## 13. `data/performance_findings.json` structure
+
+```json
+{
+  "analysis_metadata": {
+    "generated_at": "...",
+    "analysis_end_date": "...",
+    "last_7_day_window": { "start": "...", "end": "..." },
+    "previous_7_day_window": { "start": "...", "end": "..." },
+    "campaigns_analyzed": 0,
+    "findings_generated": 0
+  },
+  "account_summary": {
+    "last_7_days": { "...": "..." },
+    "previous_7_days": { "...": "..." },
+    "changes": { "...": "..." }
+  },
+  "findings": [ { "finding_id": "...", "...": "..." } ]
+}
+```
+
+## 14. `ai_analyst.py` -- the AI executive analyst
+
+Reads `data/performance_findings.json` and makes **one**, deliberately plain
+call to the Anthropic Messages API -- just `model`, `max_tokens`, `system`,
+and `messages`. No thinking configuration or effort tuning is set; those are
+optional API features, not requirements for this task, and leaving them out
+keeps the call simple and easy to reason about.
+
+**The model ID is read exclusively from the `ANTHROPIC_MODEL` environment
+variable -- there is no hardcoded default in the script.** A model ID
+appearing in an SDK's type hints or a cached model catalog is not proof that
+it's valid or available for a given account, so this script does not assume
+one on your behalf. If `ANTHROPIC_MODEL` is unset, the script fails
+immediately with a message telling you to configure it (see section 17)
+rather than guessing a model to call.
+
+The system prompt given to Claude enforces the boundaries above: it must not
+recalculate metrics, must not invent a cause for anything, and must label
+every claim as FACT, SIGNAL, or RECOMMENDATION. The report follows a fixed
+structure: Executive Summary (max 5 bullets), Critical Issues, High Priority
+Risks, Funnel Health, Scaling Opportunities, Recommended Actions -- Next 24
+Hours (max 5 actions), and an Account Performance Snapshot table.
+
+`ANTHROPIC_API_KEY` is read only from that environment variable -- never
+hardcoded, never logged, never written to the report. If the key or the
+model ID is missing, or the Anthropic API call fails for any reason (invalid
+key, rate limit, network error, refusal), the script prints a clear error and
+exits non-zero **without writing any report file** -- it never produces a
+placeholder or fabricated report on failure.
+
+## 15. Running Layer 2 locally
+
+With Layer 1 already run (so `data/meta_campaign_daily.csv` exists) and both
+`ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` set in your environment (same rule
+as `META_ACCESS_TOKEN` in section 7 -- never paste either into a chat):
+
+```bash
+export ANTHROPIC_MODEL=your-chosen-model-id
+python performance_analyzer.py
+python ai_analyst.py
+```
+
+Both scripts accept `--input`/`--output` (analyzer) and `--findings`/`--output`
+(analyst) flags if you want non-default paths.
+
+## 16. Testing
+
+```bash
+python -m unittest discover -s tests -t . -v
+```
+
+The suite in `tests/test_performance_analyzer.py` uses hand-built synthetic
+metrics only -- it never calls the live Meta API or the Anthropic API. It
+covers all seven rules firing and not firing, safe handling of a zero/missing
+previous period (no `inf`/`NaN`), severity + spend sorting, and that no rule
+produces duplicate findings for the same campaign.
+
+## 17. Running via GitHub Actions
+
+The full pipeline runs automatically through
 `.github/workflows/meta-collector.yml`:
 
-- **Trigger:** once a day on a schedule (`06:00 UTC`), and on demand via
-  the "Run workflow" button (`workflow_dispatch`), with optional `since` /
-  `until` inputs to override the default date range for that run.
-- **Secrets:** `META_ACCESS_TOKEN` and `META_AD_ACCOUNT_ID` must be
-  configured as repository secrets (Settings → Secrets and variables →
-  Actions). The workflow passes them to `meta_collector.py` as environment
-  variables and never logs them.
-- **Validation:** after collection, `validate_output.py` checks total rows,
-  unique campaigns, the collected date range, total spend, total canonical
-  purchases and purchase value, duplicate campaign-date rows, and
-  pagination completeness (via the `collection_metadata.json` sidecar
-  written by the collector). The job fails if no rows were collected or if
-  duplicate campaign-date rows are found.
-- **Output:** `data/meta_campaign_daily.csv` is uploaded as a workflow
-  artifact for each run. It is never committed to the repository -- both
-  the CSV and the metadata sidecar are covered by `.gitignore`.
+1. **Trigger:** once a day on a schedule (`06:00 UTC`), and on demand via
+   the "Run workflow" button (`workflow_dispatch`), with optional `since` /
+   `until` inputs to override the collector's default date range for that
+   run.
+2. **Collect:** `meta_collector.py` fetches campaign-level daily data.
+3. **Validate:** `validate_output.py` checks total rows, unique campaigns,
+   date range, total spend, total canonical purchases and purchase value,
+   duplicate campaign-date rows, and pagination completeness. The job fails
+   here if no rows were collected or duplicates are found -- Layer 2 never
+   runs against unvalidated data.
+4. **Analyze:** `performance_analyzer.py` runs the deterministic rule engine.
+   If it fails for any reason, the workflow fails immediately.
+5. **Report:** `ai_analyst.py` calls the Anthropic API to write the executive
+   report. If `ANTHROPIC_MODEL` isn't configured, or the API call fails for
+   any reason, this step fails with a clear error and the workflow fails --
+   it does not fall back to a fake report.
+6. **Upload artifacts:** `data/meta_campaign_daily.csv` is uploaded as one
+   artifact; `data/performance_findings.json` and
+   `reports/meta_performance_report.md` are uploaded together as a second
+   artifact. None of these three files are committed to the repository --
+   all are covered by `.gitignore`.
+
+### Required GitHub secrets and variables
+
+Configure these under Settings → Secrets and variables → Actions:
+
+| Name | Kind | Used by |
+|---|---|---|
+| `META_ACCESS_TOKEN` | Secret | `meta_collector.py` |
+| `META_AD_ACCOUNT_ID` | Secret | `meta_collector.py` |
+| `ANTHROPIC_API_KEY` | Secret | `ai_analyst.py` |
+| `ANTHROPIC_MODEL` | **Variable** (Variables tab, not Secrets) | `ai_analyst.py` |
+
+`ANTHROPIC_MODEL` is a repository *variable* rather than a secret because a
+model ID is not sensitive -- it's configuration, not a credential. The
+workflow passes it as `ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}` (note
+`vars.*`, not `secrets.*`). All four are passed to the relevant step as
+environment variables and are never printed or logged by any script in this
+repository.
+
+## 18. Security approach
+
+- Credentials are read exclusively from environment variables
+  (`META_ACCESS_TOKEN`, `META_AD_ACCOUNT_ID`, `ANTHROPIC_API_KEY`) -- never
+  hardcoded, never logged, never written to a CSV, JSON, or markdown output.
+- The Anthropic model ID is also read exclusively from an environment
+  variable (`ANTHROPIC_MODEL`), separately from the API key, since it's
+  configuration rather than a secret -- but it is still never hardcoded or
+  guessed: the script has no default and fails clearly if it's unset.
+- `.env` and all generated data (`data/*.csv`, `data/*.json`,
+  `reports/*.md`) are excluded from version control via `.gitignore`.
+- The deterministic engine and the AI analyst are hard-separated: the AI
+  never sees raw API responses or credentials, only the already-computed,
+  already-validated findings JSON.
+- The AI is explicitly constrained to label claims as FACT / SIGNAL /
+  RECOMMENDATION and forbidden from asserting unproven causes.
+- Every stage fails loudly (non-zero exit, clear message) rather than
+  silently producing partial or fabricated output.
+
+## 19. Limitations
+
+- The rule thresholds (e.g. 2,000 spend, 40% CPA increase, 35% ROAS decline)
+  are fixed starting points, not tuned to any specific account -- revisit
+  them as real data comes in.
+- The analysis window is always "last 7 days vs. previous 7 days" ending on
+  the dataset's max date; it does not yet support custom window lengths or
+  day-of-week seasonality adjustments.
+- The AI analyst makes one non-streaming API call per run; very large
+  findings sets (many campaigns with many simultaneous findings) could
+  approach context/output limits and may need chunking in a future revision.
+- This is still not an anomaly-detection or forecasting system in the
+  statistical sense -- it is a fixed, transparent rule engine plus an LLM
+  writer. There is no historical baselining, seasonality modeling, or
+  learned thresholds yet.
+- No dashboard, alerting/notification integration, or automated
+  bid/budget optimisation exists yet -- those remain future phases.
