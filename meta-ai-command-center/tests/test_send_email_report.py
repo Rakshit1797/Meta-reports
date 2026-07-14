@@ -21,12 +21,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import send_email_report as ser  # noqa: E402
 
-def _make_findings(account_currency, spend=1000.0, purchase_value=3000.0, cpa=50.0):
+
+def _make_findings(account_currency, spend=1000.0, purchase_value=3000.0, cpa=50.0, landing_page_views=200.0):
     return {
-        "analysis_metadata": {"analysis_end_date": "2026-07-14", "account_currency": account_currency},
+        "analysis_metadata": {
+            "analysis_end_date": "2026-07-14",
+            "account_currency": account_currency,
+            "last_7_day_window": {"start": "2026-07-08", "end": "2026-07-14"},
+        },
         "account_summary": {
             "last_7_days": {
                 "spend": spend, "purchase_value": purchase_value, "purchases": 20.0, "roas": 3.0, "cpa": cpa,
+                "landing_page_views": landing_page_views,
             }
         },
         "account_integrity": {"decision_confidence": "HIGH"},
@@ -35,6 +41,13 @@ def _make_findings(account_currency, spend=1000.0, purchase_value=3000.0, cpa=50
             {"severity": "positive", "category": "scaling_opportunity"},
             {"severity": "positive", "category": "scaling_opportunity"},
             {"severity": "high", "category": "tracking_risk"},
+        ],
+        "management_signals": [
+            {"signal": "Wasted spend detected", "business_implication": "Budget is being lost.", "confidence": "HIGH"},
+        ],
+        "management_decisions": [
+            {"priority": "critical", "decision": "Pause underperforming campaign", "evidence": "Zero purchases.",
+             "commercial_implication": "Avoid further loss.", "confidence": "HIGH"},
         ],
     }
 
@@ -45,38 +58,79 @@ SAMPLE_FINDINGS = _make_findings("USD")
 
 
 class TestSnapshotConstruction(unittest.TestCase):
-    def test_snapshot_counts_and_formats_are_deterministic(self):
+    def test_snapshot_values_are_deterministic(self):
         snapshot = ser.build_snapshot(SAMPLE_FINDINGS)
-        self.assertEqual(snapshot["critical_issues_count"], "1")
-        self.assertEqual(snapshot["scaling_opportunities_count"], "2")
         self.assertEqual(snapshot["decision_confidence"], "HIGH")
         self.assertEqual(snapshot["total_spend"], "$1,000.00")
         self.assertEqual(snapshot["purchase_value"], "$3,000.00")
         self.assertEqual(snapshot["purchases"], "20")
         self.assertEqual(snapshot["roas"], "3.00")
         self.assertEqual(snapshot["cpa"], "$50.00")
+        self.assertEqual(snapshot["website_landings"], "200")
+        self.assertEqual(snapshot["reporting_period"], "2026-07-08 to 2026-07-14")
 
     def test_null_metrics_render_as_na(self):
         findings = {
-            "analysis_metadata": {"account_currency": "USD"},
+            "analysis_metadata": {"account_currency": "USD", "last_7_day_window": {"start": "2026-07-08", "end": "2026-07-14"}},
             "account_summary": {"last_7_days": {"spend": 0.0, "purchase_value": 0.0, "purchases": 0.0,
-                                                   "roas": None, "cpa": None}},
+                                                   "roas": None, "cpa": None, "landing_page_views": None}},
             "account_integrity": {"decision_confidence": "LOW"},
             "findings": [],
         }
         snapshot = ser.build_snapshot(findings)
         self.assertEqual(snapshot["roas"], "N/A")
         self.assertEqual(snapshot["cpa"], "N/A")
+        self.assertEqual(snapshot["website_landings"], "N/A")
 
-    def test_subject_uses_deterministic_report_date(self):
+    def test_subject_format(self):
         subject = ser.build_subject(SAMPLE_FINDINGS)
-        self.assertEqual(subject, "Meta Ads Performance Report — 2026-07-14")
+        self.assertEqual(subject, "Meta Ads Executive Performance Brief | 2026-07-14")
 
-    def test_html_body_contains_required_message_and_snapshot(self):
-        html = ser.build_html_body(ser.build_snapshot(SAMPLE_FINDINGS))
-        self.assertIn("The complete Meta Ads Performance Intelligence workbook is attached.", html)
+    def test_html_body_contains_required_sections_and_snapshot(self):
+        snapshot = ser.build_snapshot(SAMPLE_FINDINGS)
+        html = ser.build_html_body(
+            snapshot, verdict="Account performance is stable.",
+            signals=SAMPLE_FINDINGS["management_signals"], decisions=SAMPLE_FINDINGS["management_decisions"],
+        )
+        self.assertIn(
+            "Full campaign portfolio, funnel analysis, trend analysis, AI management brief, and raw Meta "
+            "data are attached in the Excel performance pack.",
+            html,
+        )
         self.assertIn("$1,000.00", html)
         self.assertIn("HIGH", html)
+        self.assertIn("Executive Verdict", html)
+        self.assertIn("Account performance is stable.", html)
+        self.assertIn("Top 3 Management Signals", html)
+        self.assertIn("Wasted spend detected", html)
+        self.assertIn("Decisions Required This Week", html)
+        self.assertIn("Pause underperforming campaign", html)
+
+    def test_html_body_falls_back_to_no_evidence_wording_when_no_signals_or_decisions(self):
+        snapshot = ser.build_snapshot(SAMPLE_FINDINGS)
+        html = ser.build_html_body(snapshot, verdict="", signals=[], decisions=[])
+        self.assertIn(ser.NO_CONTENT_FALLBACK, html)
+
+
+class TestLpvEmailBehavior(unittest.TestCase):
+    """Covers requirement: email must show LPV as N/A when unavailable, never a fabricated zero."""
+
+    def test_website_landings_shows_na_when_unavailable(self):
+        findings = _make_findings("USD", landing_page_views=None)
+        snapshot = ser.build_snapshot(findings)
+        self.assertEqual(snapshot["website_landings"], "N/A")
+
+    def test_website_landings_shows_real_count_when_available(self):
+        findings = _make_findings("USD", landing_page_views=350.0)
+        snapshot = ser.build_snapshot(findings)
+        self.assertEqual(snapshot["website_landings"], "350")
+
+    def test_html_body_never_shows_zero_for_unavailable_lpv(self):
+        findings = _make_findings("USD", landing_page_views=None)
+        snapshot = ser.build_snapshot(findings)
+        html = ser.build_html_body(snapshot)
+        self.assertNotIn(">0<", html)
+        self.assertIn("N/A", html)
 
 
 class TestCurrencyFormatting(unittest.TestCase):
@@ -107,7 +161,8 @@ class TestCurrencyFormatting(unittest.TestCase):
         self.assertNotIn("$", snapshot["total_spend"])
 
     def test_email_html_body_uses_inr_symbol_not_dollar(self):
-        html = ser.build_html_body(ser.build_snapshot(_make_findings("INR", spend=10282.30)))
+        snapshot = ser.build_snapshot(_make_findings("INR", spend=10282.30))
+        html = ser.build_html_body(snapshot)
         self.assertIn("₹10,282.30", html)
         self.assertNotIn("$10,282.30", html)
 
@@ -132,24 +187,44 @@ class TestConfigValidation(unittest.TestCase):
             self.assertEqual(config["from"], "from@example.com")
 
 
+class TestAiVerdictLoading(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+
+    def test_missing_report_falls_back_without_raising(self):
+        verdict = ser.load_ai_verdict(os.path.join(self.tmp_dir, "does_not_exist.md"))
+        self.assertEqual(verdict, ser.NO_CONTENT_FALLBACK)
+
+    def test_verdict_extracted_from_real_report(self):
+        report_path = os.path.join(self.tmp_dir, "report.md")
+        with open(report_path, "w") as f:
+            f.write("## EXECUTIVE VERDICT\nAccount performance is winning this period.\n\n## WHAT MATERIALLY CHANGED\nSomething.\n")
+        verdict = ser.load_ai_verdict(report_path)
+        self.assertEqual(verdict, "Account performance is winning this period.")
+
+
 class TestMockedEmailDelivery(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
         self.workbook_path = os.path.join(self.tmp_dir, "meta_ads_performance_intelligence.xlsx")
         wb = openpyxl.Workbook()
         wb.save(self.workbook_path)
+        self.report_path = os.path.join(self.tmp_dir, "meta_performance_report.md")
+        with open(self.report_path, "w") as f:
+            f.write("## EXECUTIVE VERDICT\nStable performance this period.\n")
 
     def test_send_report_email_attaches_workbook_without_live_call(self):
         config = {"api_key": "sk-fake", "to": "test@example.com", "from": "noreply@example.com"}
         with mock.patch("resend.Emails.send") as mock_send:
             mock_send.return_value = {"id": "mock-email-id"}
-            email_id = ser.send_report_email(config, SAMPLE_FINDINGS, self.workbook_path)
+            email_id = ser.send_report_email(config, SAMPLE_FINDINGS, self.workbook_path, self.report_path)
 
         self.assertEqual(email_id, "mock-email-id")
         mock_send.assert_called_once()
         sent_params = mock_send.call_args[0][0]
         self.assertEqual(sent_params["to"], ["test@example.com"])
         self.assertEqual(sent_params["from"], "noreply@example.com")
+        self.assertEqual(sent_params["subject"], "Meta Ads Executive Performance Brief | 2026-07-14")
         self.assertEqual(len(sent_params["attachments"]), 1)
         self.assertEqual(sent_params["attachments"][0]["filename"], "meta_ads_performance_intelligence.xlsx")
         self.assertIsInstance(sent_params["attachments"][0]["content"], list)
@@ -158,7 +233,7 @@ class TestMockedEmailDelivery(unittest.TestCase):
         config = {"api_key": "sk-fake", "to": "test@example.com", "from": "noreply@example.com"}
         with mock.patch("resend.Emails.send") as mock_send:
             with self.assertRaises(ser.EmailDeliveryError):
-                ser.send_report_email(config, SAMPLE_FINDINGS, os.path.join(self.tmp_dir, "does_not_exist.xlsx"))
+                ser.send_report_email(config, SAMPLE_FINDINGS, os.path.join(self.tmp_dir, "does_not_exist.xlsx"), self.report_path)
             mock_send.assert_not_called()
 
     def test_resend_error_is_wrapped_clearly_and_never_leaks_api_key(self):
@@ -171,7 +246,7 @@ class TestMockedEmailDelivery(unittest.TestCase):
                 suggested_action="Check your key",
             )
             with self.assertRaises(ser.EmailDeliveryError) as ctx:
-                ser.send_report_email(config, SAMPLE_FINDINGS, self.workbook_path)
+                ser.send_report_email(config, SAMPLE_FINDINGS, self.workbook_path, self.report_path)
             self.assertNotIn("sk-super-secret-value", str(ctx.exception))
 
 
