@@ -26,6 +26,7 @@ import pandas as pd
 
 DEFAULT_INPUT_PATH = os.path.join("data", "meta_campaign_daily.csv")
 DEFAULT_OUTPUT_PATH = os.path.join("data", "performance_findings.json")
+DEFAULT_METADATA_PATH = os.path.join("data", "collection_metadata.json")
 
 WINDOW_LENGTH_DAYS = 7
 
@@ -43,6 +44,41 @@ SCALING_MIN_ROAS = 2.0
 SCALING_MIN_CPA_IMPROVEMENT_PCT = 20.0
 
 SEVERITY_SORT_ORDER = {"critical": 0, "high": 1, "medium": 2, "positive": 3, "low": 4}
+
+# --- Data integrity / decision confidence thresholds -----------------------
+# These are additive to the rule engine above -- they do not change any of
+# the 7 existing rules' thresholds or severities.
+EXTREME_CHANGE_THRESHOLD_PCT = 300.0
+TRAFFIC_SPEND_INCONSISTENCY_CHANGE_PCT = 100.0
+TRAFFIC_SPEND_INCONSISTENCY_STABLE_SPEND_PCT = 10.0
+PURCHASE_SURGE_THRESHOLD_PCT = 100.0
+PURCHASE_SURGE_TRAFFIC_FLAT_PCT = 10.0
+CONFLICTING_SIGNAL_CTR_DECLINE_PCT = 20.0
+MIN_CLICKS_FOR_RELIABLE_SAMPLE = 50
+MIN_IMPRESSIONS_FOR_RELIABLE_SAMPLE = 500
+
+# AI Status priority hierarchy (highest priority first). A campaign's status
+# is the highest-priority entry among the statuses implied by its findings.
+AI_STATUS_PRIORITY = [
+    "TRACKING WARNING",
+    "EFFICIENCY RISK",
+    "CREATIVE FATIGUE",
+    "SCALE",
+    "MONITOR",
+    "INSUFFICIENT DATA",
+]
+
+# Maps an existing rule's category to the AI Status it implies. Existing
+# rule categories/severities are unchanged -- this only adds a label.
+CATEGORY_TO_AI_STATUS = {
+    "tracking_risk": "TRACKING WARNING",
+    "wasted_spend": "EFFICIENCY RISK",
+    "cost_increase": "EFFICIENCY RISK",
+    "performance_decline": "EFFICIENCY RISK",
+    "funnel_issue": "EFFICIENCY RISK",
+    "creative_fatigue": "CREATIVE FATIGUE",
+    "scaling_opportunity": "SCALE",
+}
 
 REQUIRED_COLUMNS = [
     "date",
@@ -91,7 +127,11 @@ def safe_pct_change(current: Optional[float], previous: Optional[float]) -> Opti
 
 def load_dataset(path: str) -> pd.DataFrame:
     try:
-        df = pd.read_csv(path)
+        # campaign_id is an opaque identifier, never used arithmetically --
+        # read it as text so it matches how the rest of the pipeline (and
+        # Excel) treats it, and to avoid float64 precision loss on long
+        # numeric IDs if pandas would otherwise infer a numeric dtype.
+        df = pd.read_csv(path, dtype={"campaign_id": str})
     except FileNotFoundError as exc:
         raise AnalysisError(
             f"Input file '{path}' not found. Run meta_collector.py first."
@@ -109,6 +149,21 @@ def load_dataset(path: str) -> pd.DataFrame:
 
     df["date"] = pd.to_datetime(df["date"]).dt.date
     return df
+
+
+def load_account_currency(metadata_path: str) -> Optional[str]:
+    """Best-effort read of the account currency written by meta_collector.py.
+
+    Never raises -- this is enrichment only. If the metadata file is
+    missing, unreadable, or doesn't have the field, this returns None and
+    downstream consumers must not assume a currency (e.g. USD).
+    """
+    try:
+        with open(metadata_path) as metadata_file:
+            metadata = json.load(metadata_file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return metadata.get("account_currency")
 
 
 def get_analysis_windows(df: pd.DataFrame) -> Dict[str, Any]:
@@ -430,10 +485,195 @@ def sort_findings(findings: List[Dict[str, Any]], last7_spend_by_campaign: Dict[
 
 
 # ---------------------------------------------------------------------------
+# Data integrity, AI Status, and decision confidence
+#
+# This section is additive: it never changes the 7 rules above, their
+# thresholds, or their severities. It only detects data-quality anomalies
+# and derives a status/confidence label from the rule engine's own output,
+# so both the AI analyst and the Excel report have a deterministic,
+# auditable classification to work from instead of inventing one.
+# ---------------------------------------------------------------------------
+
+def detect_integrity_warnings(
+    entity_id: str,
+    entity_name: str,
+    last7: Dict[str, Any],
+    previous7: Dict[str, Any],
+    changes: Dict[str, Optional[float]],
+) -> List[Dict[str, Any]]:
+    """Flag suspicious data patterns for one entity (a campaign or the whole account).
+
+    Every warning uses hedged language ("may indicate", "possible signal",
+    "requires validation") -- this function never asserts a root cause, only
+    that something looks inconsistent and should be checked.
+    """
+    warnings: List[Dict[str, Any]] = []
+
+    def add(warning_type: str, severity: str, message: str) -> None:
+        warnings.append(
+            {
+                "type": warning_type,
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+                "severity": severity,
+                "message": message,
+            }
+        )
+
+    if last7["initiated_checkouts"] > last7["add_to_carts"]:
+        add(
+            "checkouts_exceed_add_to_carts",
+            "high",
+            f"Initiated checkouts ({last7['initiated_checkouts']:.0f}) exceed add-to-carts "
+            f"({last7['add_to_carts']:.0f}) in the last 7 days. This may indicate an event-ordering "
+            "or tracking anomaly and requires validation before drawing funnel conclusions.",
+        )
+
+    if last7["checkout_to_purchase_rate"] is not None and last7["checkout_to_purchase_rate"] > 1.0:
+        add(
+            "conversion_rate_above_100_percent",
+            "high",
+            f"Checkout-to-purchase rate is {last7['checkout_to_purchase_rate'] * 100:.1f}%, above 100%. "
+            "This cannot be confirmed from available data and may indicate duplicate or "
+            "misattributed purchase events.",
+        )
+
+    if last7["purchases"] > last7["initiated_checkouts"]:
+        add(
+            "purchases_exceed_checkouts",
+            "high",
+            f"Purchases ({last7['purchases']:.0f}) exceed initiated checkouts "
+            f"({last7['initiated_checkouts']:.0f}) in the last 7 days, which requires validation "
+            "of the checkout and purchase event tracking.",
+        )
+
+    for metric_key, metric_label, change_key in (
+        ("spend", "spend", "spend_pct_change"),
+        ("purchases", "purchases", "purchases_pct_change"),
+    ):
+        change = changes.get(change_key)
+        if change is not None and abs(change) >= EXTREME_CHANGE_THRESHOLD_PCT:
+            add(
+                f"extreme_discontinuity_{metric_key}",
+                "medium",
+                f"{metric_label.capitalize()} changed {change:.1f}% versus the previous 7 days, "
+                "an extreme period-over-period discontinuity that may indicate a data collection "
+                "issue, a major account change, or a possible signal worth investigating.",
+            )
+
+    impressions_change = safe_pct_change(last7["impressions"], previous7["impressions"])
+    clicks_change = safe_pct_change(last7["clicks"], previous7["clicks"])
+    spend_change = changes.get("spend_pct_change")
+
+    if (
+        impressions_change is not None
+        and spend_change is not None
+        and abs(impressions_change) >= TRAFFIC_SPEND_INCONSISTENCY_CHANGE_PCT
+        and abs(spend_change) < TRAFFIC_SPEND_INCONSISTENCY_STABLE_SPEND_PCT
+    ):
+        add(
+            "impressions_spend_inconsistency",
+            "medium",
+            f"Impressions changed {impressions_change:.1f}% while spend changed only "
+            f"{spend_change:.1f}%. This possible signal may indicate a delivery, auction, or "
+            "tracking change and requires validation.",
+        )
+
+    if (
+        clicks_change is not None
+        and spend_change is not None
+        and abs(clicks_change) >= TRAFFIC_SPEND_INCONSISTENCY_CHANGE_PCT
+        and abs(spend_change) < TRAFFIC_SPEND_INCONSISTENCY_STABLE_SPEND_PCT
+    ):
+        add(
+            "clicks_spend_inconsistency",
+            "medium",
+            f"Clicks changed {clicks_change:.1f}% while spend changed only {spend_change:.1f}%. "
+            "This possible signal may indicate a creative, audience, or tracking change and "
+            "requires validation.",
+        )
+
+    purchases_change = changes.get("purchases_pct_change")
+    if (
+        purchases_change is not None
+        and purchases_change >= PURCHASE_SURGE_THRESHOLD_PCT
+        and clicks_change is not None
+        and clicks_change < PURCHASE_SURGE_TRAFFIC_FLAT_PCT
+    ):
+        add(
+            "purchase_surge_without_traffic_growth",
+            "medium",
+            f"Purchases increased {purchases_change:.1f}% while clicks changed only "
+            f"{clicks_change:.1f}%. This possible signal may indicate an attribution or "
+            "tracking anomaly and cannot be confirmed from available data alone.",
+        )
+
+    roas_change = changes.get("roas_pct_change")
+    ctr_change = changes.get("ctr_pct_change")
+    if (
+        roas_change is not None
+        and roas_change > 0
+        and ctr_change is not None
+        and ctr_change <= -CONFLICTING_SIGNAL_CTR_DECLINE_PCT
+    ):
+        add(
+            "conflicting_roas_ctr_signal",
+            "low",
+            f"ROAS improved {roas_change:.1f}% while CTR declined {abs(ctr_change):.1f}%. These "
+            "conflicting signals may indicate early creative fatigue that current conversion "
+            "efficiency is masking, and requires monitoring rather than a confident conclusion.",
+        )
+
+    return warnings
+
+
+def classify_decision_confidence(
+    integrity_warnings: List[Dict[str, Any]],
+    tracking_risk_present: bool,
+    sample_size_ok: bool,
+) -> str:
+    """Deterministically classify HIGH / MEDIUM / LOW confidence.
+
+    - LOW: a tracking-risk finding is present, or 2+ high-severity integrity
+      warnings exist -- decisions should not be made with high confidence.
+    - MEDIUM: any integrity warning exists, or the sample size is too small
+      to trust ratio metrics.
+    - HIGH: no integrity warnings, a confirmed tracking issue, or sample
+      size concern.
+    """
+    high_severity_warning_count = sum(1 for w in integrity_warnings if w["severity"] in ("high", "critical"))
+
+    if tracking_risk_present or high_severity_warning_count >= 2:
+        return "LOW"
+    if integrity_warnings or not sample_size_ok:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def compute_ai_status(campaign_findings: List[Dict[str, Any]], has_sufficient_data: bool) -> str:
+    """Derive a single AI Status from a campaign's findings using the priority hierarchy."""
+    if not has_sufficient_data:
+        return "INSUFFICIENT DATA"
+
+    implied_statuses = {
+        CATEGORY_TO_AI_STATUS[f["category"]]
+        for f in campaign_findings
+        if f["category"] in CATEGORY_TO_AI_STATUS
+    }
+    if not implied_statuses:
+        return "MONITOR"
+
+    for status in AI_STATUS_PRIORITY:
+        if status in implied_statuses:
+            return status
+    return "MONITOR"
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def analyze(df: pd.DataFrame) -> Dict[str, Any]:
+def analyze(df: pd.DataFrame, account_currency: Optional[str] = None) -> Dict[str, Any]:
     windows = get_analysis_windows(df)
     last_start = windows["last_7_day_window"]["start"]
     last_end = windows["last_7_day_window"]["end"]
@@ -442,6 +682,8 @@ def analyze(df: pd.DataFrame) -> Dict[str, Any]:
 
     all_findings: List[Dict[str, Any]] = []
     last7_spend_by_campaign: Dict[Any, float] = {}
+    campaign_summaries: List[Dict[str, Any]] = []
+    all_integrity_warnings: List[Dict[str, Any]] = []
 
     campaigns = df[["campaign_id", "campaign_name"]].drop_duplicates()
 
@@ -455,8 +697,34 @@ def analyze(df: pd.DataFrame) -> Dict[str, Any]:
         changes = compute_changes(last7, previous7)
 
         last7_spend_by_campaign[campaign_id] = last7["spend"]
-        all_findings.extend(
-            generate_findings_for_campaign(campaign_id, campaign_name, last7, previous7, changes)
+        campaign_findings = generate_findings_for_campaign(campaign_id, campaign_name, last7, previous7, changes)
+        all_findings.extend(campaign_findings)
+
+        campaign_integrity_warnings = detect_integrity_warnings(
+            campaign_id, campaign_name, last7, previous7, changes
+        )
+        all_integrity_warnings.extend(campaign_integrity_warnings)
+
+        has_sufficient_data = (last7["impressions"] + previous7["impressions"]) > 0
+        tracking_risk_present = any(f["category"] == "tracking_risk" for f in campaign_findings)
+        sample_size_ok = (
+            last7["clicks"] >= MIN_CLICKS_FOR_RELIABLE_SAMPLE
+            and last7["impressions"] >= MIN_IMPRESSIONS_FOR_RELIABLE_SAMPLE
+        )
+
+        campaign_summaries.append(
+            {
+                "campaign_id": campaign_id,
+                "campaign_name": campaign_name,
+                "last_7_days": last7,
+                "previous_7_days": previous7,
+                "changes": changes,
+                "ai_status": compute_ai_status(campaign_findings, has_sufficient_data),
+                "decision_confidence": classify_decision_confidence(
+                    campaign_integrity_warnings, tracking_risk_present, sample_size_ok
+                ),
+                "integrity_warnings": campaign_integrity_warnings,
+            }
         )
 
     all_findings = sort_findings(all_findings, last7_spend_by_campaign)
@@ -464,6 +732,18 @@ def analyze(df: pd.DataFrame) -> Dict[str, Any]:
     account_last7 = aggregate_window(df, last_start, last_end)
     account_previous7 = aggregate_window(df, previous_start, previous_end)
     account_changes = compute_changes(account_last7, account_previous7)
+
+    account_integrity_warnings = detect_integrity_warnings(
+        "ACCOUNT", "Account-Wide", account_last7, account_previous7, account_changes
+    )
+    account_tracking_risk_present = any(f["category"] == "tracking_risk" for f in all_findings)
+    account_sample_size_ok = (
+        account_last7["clicks"] >= MIN_CLICKS_FOR_RELIABLE_SAMPLE
+        and account_last7["impressions"] >= MIN_IMPRESSIONS_FOR_RELIABLE_SAMPLE
+    )
+    account_decision_confidence = classify_decision_confidence(
+        account_integrity_warnings, account_tracking_risk_present, account_sample_size_ok
+    )
 
     return {
         "analysis_metadata": {
@@ -479,13 +759,20 @@ def analyze(df: pd.DataFrame) -> Dict[str, Any]:
             },
             "campaigns_analyzed": int(len(campaigns)),
             "findings_generated": len(all_findings),
+            "integrity_warnings_generated": len(all_integrity_warnings) + len(account_integrity_warnings),
+            "account_currency": account_currency,
         },
         "account_summary": {
             "last_7_days": account_last7,
             "previous_7_days": account_previous7,
             "changes": account_changes,
         },
+        "account_integrity": {
+            "decision_confidence": account_decision_confidence,
+            "warnings": account_integrity_warnings,
+        },
         "findings": all_findings,
+        "campaigns": campaign_summaries,
     }
 
 
@@ -495,6 +782,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input", default=DEFAULT_INPUT_PATH, help="Path to the cleaned campaign daily CSV.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT_PATH, help="Path to write the findings JSON.")
+    parser.add_argument(
+        "--metadata",
+        default=DEFAULT_METADATA_PATH,
+        help="Path to collection_metadata.json (used only to read the account currency, if present).",
+    )
     return parser.parse_args()
 
 
@@ -503,7 +795,8 @@ def main() -> None:
 
     try:
         df = load_dataset(args.input)
-        results = analyze(df)
+        account_currency = load_account_currency(args.metadata)
+        results = analyze(df, account_currency=account_currency)
     except AnalysisError as exc:
         print(f"Analysis error: {exc}")
         sys.exit(1)

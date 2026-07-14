@@ -278,6 +278,37 @@ def fetch_campaign_insights(
     return all_records, page_number
 
 
+def fetch_account_currency(access_token: str, ad_account_id: str) -> Optional[str]:
+    """Best-effort fetch of the ad account's currency (e.g. "INR", "USD").
+
+    This is a separate, additive lookup from the insights collection above --
+    it exists purely so downstream reporting (Excel, email) can format
+    amounts in the account's real currency instead of assuming USD. If it
+    fails for any reason, collection still succeeds; the currency is simply
+    recorded as unavailable (None) in collection_metadata.json rather than
+    guessed.
+    """
+    url = f"{GRAPH_API_BASE_URL}/{ad_account_id}"
+    params = {"fields": "currency", "access_token": access_token}
+
+    try:
+        response_json = _request_with_retries(url, params)
+    except MetaApiError as exc:
+        print(f"Warning: could not fetch account currency ({exc}). Recording currency as unavailable.")
+        return None
+
+    if "error" in response_json:
+        print("Warning: Meta API returned an error fetching account currency. Recording currency as unavailable.")
+        return None
+
+    currency = response_json.get("currency")
+    if not currency:
+        print("Warning: account currency field was empty in the Meta API response. Recording currency as unavailable.")
+        return None
+
+    return currency
+
+
 # ---------------------------------------------------------------------------
 # Cleaning + metric calculation
 # ---------------------------------------------------------------------------
@@ -431,6 +462,13 @@ def main() -> None:
     dataset = clean_insights_records(raw_records)
     print(f"Cleaned dataset contains {len(dataset)} row(s).")
 
+    account_currency = fetch_account_currency(
+        access_token=credentials["access_token"],
+        ad_account_id=credentials["ad_account_id"],
+    )
+    if account_currency:
+        print(f"Detected account currency: {account_currency}")
+
     output_dir = os.path.dirname(args.output)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -444,6 +482,7 @@ def main() -> None:
     metadata = {
         "since": args.since,
         "until": args.until,
+        "account_currency": account_currency,
         "pages_fetched": pages_fetched,
         "raw_record_count": len(raw_records),
         "cleaned_row_count": len(dataset),
