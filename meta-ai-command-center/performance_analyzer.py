@@ -56,6 +56,62 @@ PURCHASE_SURGE_TRAFFIC_FLAT_PCT = 10.0
 CONFLICTING_SIGNAL_CTR_DECLINE_PCT = 20.0
 MIN_CLICKS_FOR_RELIABLE_SAMPLE = 50
 MIN_IMPRESSIONS_FOR_RELIABLE_SAMPLE = 500
+LPV_EXCEEDS_CLICKS_TOLERANCE_PCT = 20.0
+MISSING_LPV_MIN_CLICKS = 100
+
+# --- Management portfolio decision thresholds (additive; Campaign Portfolio
+# sheet). These classify a single deterministic decision label per campaign
+# over the collected period. They never change the 7 rules/thresholds above.
+# Tracking integrity is checked before efficiency: a campaign whose 7-day
+# decision_confidence is LOW is always INVESTIGATE TRACKING, regardless of
+# how good its ROAS looks -- SCALE is never recommended under LOW tracking
+# confidence. CUT requires both a real spend threshold and a clearly poor
+# ROAS, so a tiny sample is never CUT purely from scarcity -- it falls
+# through to INSUFFICIENT DATA instead.
+PORTFOLIO_DECISIONS = ["SCALE", "PROTECT", "MAINTAIN", "FIX", "CUT", "INVESTIGATE TRACKING", "INSUFFICIENT DATA"]
+PORTFOLIO_MIN_SPEND_FOR_DECISION = 500.0
+PORTFOLIO_SCALE_MIN_ROAS = 3.0
+PORTFOLIO_SCALE_MIN_PURCHASES = 5
+PORTFOLIO_PROTECT_MIN_ROAS = 2.0
+PORTFOLIO_FIX_MAX_ROAS = 1.0
+PORTFOLIO_CUT_MIN_SPEND = 2000.0
+PORTFOLIO_CUT_MAX_ROAS = 0.5
+
+# Moving-average window for noisy daily efficiency metrics on the Trend &
+# Efficiency sheet (e.g. ROAS/CPA day to day).
+MOVING_AVERAGE_WINDOW_DAYS = 7
+
+# Marketing Funnel stages, in order. Each stage's conversion rate is
+# volume-at-this-stage / volume-at-previous-stage -- documented explicitly
+# per stage in FUNNEL_STAGE_FORMULAS so no formula is left implicit. Reach
+# and Clicks are annotated because Reach (unique people) and Clicks (click
+# events) are not a simple sequential population narrowing the way
+# Clicks -> LPV is, so that step is presented as a directional CTR-style
+# ratio rather than an unqualified "conversion rate".
+FUNNEL_STAGE_KEYS = [
+    "impressions", "reach", "clicks", "landing_page_views",
+    "add_to_carts", "initiated_checkouts", "purchases",
+]
+FUNNEL_STAGE_LABELS = {
+    "impressions": "Impressions",
+    "reach": "Reach",
+    "clicks": "Clicks",
+    "landing_page_views": "Website Landings (LPV)",
+    "add_to_carts": "Add to Cart",
+    "initiated_checkouts": "Initiated Checkout",
+    "purchases": "Purchase",
+}
+FUNNEL_STAGE_FORMULAS = {
+    "reach": "Reach / Impressions (de-duplication ratio -- not a drop-off).",
+    "clicks": (
+        "Clicks / Reach. Reach is unique people and Clicks is click events, so this is a "
+        "directional CTR-on-reach ratio, not a strict population-narrowing funnel step."
+    ),
+    "landing_page_views": "Website Landings / Clicks, from Meta's landing_page_view action (never clicks).",
+    "add_to_carts": "Add to Cart / Website Landings.",
+    "initiated_checkouts": "Initiated Checkout / Add to Cart.",
+    "purchases": "Purchase / Initiated Checkout.",
+}
 
 # AI Status priority hierarchy (highest priority first). A campaign's status
 # is the highest-priority entry among the statuses implied by its findings.
@@ -197,11 +253,33 @@ def aggregate_window(rows: pd.DataFrame, start, end) -> Dict[str, float]:
     add_to_carts = float(window_rows["add_to_carts"].sum())
     initiated_checkouts = float(window_rows["initiate_checkouts"].sum())
 
+    # Reach and Website Landings (LPV) are additive extensions used by the
+    # management-reporting layer (funnel/portfolio/cockpit sheets). LPV is
+    # read exclusively from Meta's own `landing_page_views` column (sourced
+    # from the canonical `landing_page_view` action in meta_collector.py) --
+    # clicks are NEVER substituted for it. If a column is absent (e.g. an
+    # older CSV predating this field), the corresponding value is None so
+    # downstream reporting shows N/A rather than a fabricated number.
+    # A column that exists but is entirely NaN for this window (e.g. an
+    # older schema's placeholder column) must still be treated as
+    # unavailable -- pandas' Series.sum() on an all-NaN column silently
+    # returns 0.0, which would otherwise be indistinguishable from a
+    # genuine zero.
+    if "reach" in window_rows.columns and window_rows["reach"].notna().any():
+        reach = float(window_rows["reach"].sum())
+    else:
+        reach = None
+    if "landing_page_views" in window_rows.columns and window_rows["landing_page_views"].notna().any():
+        landing_page_views = float(window_rows["landing_page_views"].sum())
+    else:
+        landing_page_views = None
+
     spend_per_impression = safe_divide(spend, impressions)
 
     return {
         "spend": spend,
         "impressions": impressions,
+        "reach": reach,
         "clicks": clicks,
         "ctr": safe_divide(clicks, impressions),
         "cpc": safe_divide(spend, clicks),
@@ -215,6 +293,9 @@ def aggregate_window(rows: pd.DataFrame, start, end) -> Dict[str, float]:
         "atc_rate": safe_divide(add_to_carts, clicks),
         "checkout_rate": safe_divide(initiated_checkouts, add_to_carts),
         "checkout_to_purchase_rate": safe_divide(purchases, initiated_checkouts),
+        "landing_page_views": landing_page_views,
+        "click_to_landing_page_rate": safe_divide(landing_page_views, clicks) if landing_page_views is not None else None,
+        "landing_page_to_purchase_rate": safe_divide(purchases, landing_page_views) if landing_page_views else None,
     }
 
 
@@ -624,6 +705,33 @@ def detect_integrity_warnings(
             "efficiency is masking, and requires monitoring rather than a confident conclusion.",
         )
 
+    lpv = last7.get("landing_page_views")
+    clicks_value = last7.get("clicks")
+    if lpv is not None and clicks_value:
+        if lpv > clicks_value * (1 + LPV_EXCEEDS_CLICKS_TOLERANCE_PCT / 100.0):
+            add(
+                "lpv_exceeds_clicks",
+                "medium",
+                f"Website landings ({lpv:.0f}) exceed clicks ({clicks_value:.0f}) by more than "
+                f"{LPV_EXCEEDS_CLICKS_TOLERANCE_PCT:.0f}% in the last 7 days. This may indicate a "
+                "landing-page pixel firing more than once per click or a tracking/deduplication "
+                "issue, and requires validation before drawing funnel conclusions. This is a "
+                "tracking anomaly, not a campaign performance problem.",
+            )
+    # Only flag "missing LPV" when the LPV column genuinely exists and is
+    # zero (lpv == 0.0) -- if LPV was never collected at all (lpv is None,
+    # e.g. an older CSV schema), that is an unavailable metric, not a
+    # tracking anomaly, and must not be flagged.
+    if lpv == 0 and clicks_value and clicks_value >= MISSING_LPV_MIN_CLICKS:
+        add(
+            "missing_lpv_despite_clicks",
+            "medium",
+            f"No website landings were recorded despite {clicks_value:.0f} clicks in the last 7 "
+            "days. This may indicate a landing-page pixel/tracking issue rather than a genuine "
+            "traffic-quality problem, and requires validation. This is a tracking anomaly, not a "
+            "campaign performance problem.",
+        )
+
     return warnings
 
 
@@ -667,6 +775,220 @@ def compute_ai_status(campaign_findings: List[Dict[str, Any]], has_sufficient_da
         if status in implied_statuses:
             return status
     return "MONITOR"
+
+
+# ---------------------------------------------------------------------------
+# Management reporting layer (additive)
+#
+# Everything below is new deterministic output for the senior-management
+# Excel workbook (Executive Cockpit, Lifetime/Collected-Period Performance,
+# Marketing Funnel, Campaign Portfolio, Trend & Efficiency sheets). None of
+# it changes the 7 rules, aggregate_window()'s existing keys, or any
+# existing findings/campaigns/account_summary shape above -- it only adds
+# new, independently testable functions and (in analyze()) a few additive
+# top-level keys.
+# ---------------------------------------------------------------------------
+
+def get_collected_period(df: pd.DataFrame) -> Dict[str, Any]:
+    """The full date range actually present in the collected CSV.
+
+    This is deliberately NOT the lifetime of the Meta ad account -- it is
+    only as much history as this dataset happens to contain.
+    """
+    return {"min_date": df["date"].min(), "max_date": df["date"].max()}
+
+
+def _month_key(d) -> str:
+    return d.strftime("%Y-%m")
+
+
+def aggregate_monthly_totals(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """One aggregate_window() rollup per calendar month present in the data."""
+    months = sorted({_month_key(d) for d in df["date"]})
+    results = []
+    for month in months:
+        month_rows = df[df["date"].apply(lambda d: _month_key(d) == month)]
+        totals = aggregate_window(month_rows, month_rows["date"].min(), month_rows["date"].max())
+        totals["month"] = month
+        results.append(totals)
+    return results
+
+
+def _week_start(d):
+    return d - timedelta(days=d.weekday())
+
+
+def aggregate_weekly_totals(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """One aggregate_window() rollup per Monday-start week present in the data."""
+    week_starts = sorted({_week_start(d) for d in df["date"]})
+    results = []
+    for week_start in week_starts:
+        week_end = week_start + timedelta(days=6)
+        week_rows = df[(df["date"] >= week_start) & (df["date"] <= week_end)]
+        if week_rows.empty:
+            continue
+        totals = aggregate_window(week_rows, week_rows["date"].min(), week_rows["date"].max())
+        totals["week_start"] = week_start.isoformat()
+        totals["week_end"] = week_end.isoformat()
+        results.append(totals)
+    return results
+
+
+def aggregate_daily_metrics(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """One aggregate_window() rollup per calendar day present in the data."""
+    results = []
+    for d in sorted(df["date"].unique()):
+        day_rows = df[df["date"] == d]
+        totals = aggregate_window(day_rows, d, d)
+        totals["date"] = d
+        results.append(totals)
+    return results
+
+
+def add_moving_averages(
+    daily: List[Dict[str, Any]], keys: List[str], window: int = MOVING_AVERAGE_WINDOW_DAYS
+) -> None:
+    """Add '<key>_Nd_avg' to each daily dict in place.
+
+    Uses a trailing average over whatever real days are available so far --
+    a genuine average of real data, never a fabricated placeholder for days
+    that don't exist yet.
+    """
+    for key in keys:
+        for i, day in enumerate(daily):
+            window_slice = daily[max(0, i - window + 1): i + 1]
+            values = [d.get(key) for d in window_slice if d.get(key) is not None]
+            day[f"{key}_{window}d_avg"] = (sum(values) / len(values)) if values else None
+
+
+def compute_funnel_stages(window_totals: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build the Impressions -> ... -> Purchase funnel for one aggregate_window() result."""
+    stages = []
+    previous_volume = None
+    for key in FUNNEL_STAGE_KEYS:
+        volume = window_totals.get(key)
+        conversion_rate = None
+        if previous_volume is not None and volume is not None:
+            conversion_rate = safe_divide(volume, previous_volume)
+        stages.append(
+            {
+                "stage": FUNNEL_STAGE_LABELS[key],
+                "metric_key": key,
+                "volume": volume,
+                "stage_conversion_rate": conversion_rate,
+                "drop_off_rate": (1.0 - conversion_rate) if conversion_rate is not None else None,
+                "formula": FUNNEL_STAGE_FORMULAS.get(key, "First stage -- no prior stage to convert from."),
+            }
+        )
+        previous_volume = volume
+    return stages
+
+
+def compute_biggest_funnel_leak(
+    current_stages: List[Dict[str, Any]], previous_stages: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """The funnel stage with the lowest current-period conversion rate."""
+    candidates = [
+        (cur, prev)
+        for cur, prev in zip(current_stages, previous_stages)
+        if cur["stage_conversion_rate"] is not None
+    ]
+    if not candidates:
+        return None
+    worst_current, worst_previous = min(candidates, key=lambda pair: pair[0]["stage_conversion_rate"])
+    movement = safe_pct_change(worst_current["stage_conversion_rate"], worst_previous.get("stage_conversion_rate"))
+    return {
+        "stage": worst_current["stage"],
+        "current_conversion_rate": worst_current["stage_conversion_rate"],
+        "previous_conversion_rate": worst_previous.get("stage_conversion_rate"),
+        "movement_pct": movement,
+    }
+
+
+def compute_campaign_shares(
+    campaign_totals: List[Dict[str, Any]], account_totals: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Add spend_share / sales_share (0-1 fractions of the account collected-period
+    total) to each campaign dict in place. A presentation derivative of already
+    computed totals -- no new raw metric is invented."""
+    total_spend = account_totals.get("spend") or 0.0
+    total_sales = account_totals.get("purchase_value") or 0.0
+    for entry in campaign_totals:
+        entry["spend_share"] = safe_divide(entry.get("spend"), total_spend)
+        entry["sales_share"] = safe_divide(entry.get("purchase_value"), total_sales)
+    return campaign_totals
+
+
+def classify_portfolio_decision(
+    spend: Optional[float], purchases: Optional[float], roas: Optional[float], tracking_confidence: str
+) -> str:
+    """Deterministic SCALE/PROTECT/MAINTAIN/FIX/CUT/INVESTIGATE TRACKING/INSUFFICIENT DATA decision.
+
+    See the PORTFOLIO_* threshold comments above for the documented rules.
+    """
+    if tracking_confidence == "LOW":
+        return "INVESTIGATE TRACKING"
+    if not spend or spend < PORTFOLIO_MIN_SPEND_FOR_DECISION:
+        return "INSUFFICIENT DATA"
+    if roas is None:
+        return "INSUFFICIENT DATA"
+    if roas >= PORTFOLIO_SCALE_MIN_ROAS and (purchases or 0) >= PORTFOLIO_SCALE_MIN_PURCHASES:
+        return "SCALE"
+    if spend >= PORTFOLIO_CUT_MIN_SPEND and roas < PORTFOLIO_CUT_MAX_ROAS:
+        return "CUT"
+    if roas >= PORTFOLIO_PROTECT_MIN_ROAS:
+        return "PROTECT"
+    if roas < PORTFOLIO_FIX_MAX_ROAS:
+        return "FIX"
+    return "MAINTAIN"
+
+
+def compute_wasted_spend_candidates(campaign_totals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deterministic wasted-spend definition, reusing rule_wasted_spend's own
+    criteria (spend >= WASTED_SPEND_MIN_SPEND and zero purchases) applied to
+    collected-period totals instead of the last 7 days. Nothing is called
+    'wasted' unless this explicit criterion is met."""
+    return [
+        c
+        for c in campaign_totals
+        if (c.get("spend") or 0.0) >= WASTED_SPEND_MIN_SPEND and (c.get("purchases") or 0.0) == 0
+    ]
+
+
+def compute_top_sales_contributors(campaign_totals: List[Dict[str, Any]], max_count: int = 10) -> List[Dict[str, Any]]:
+    return sorted(campaign_totals, key=lambda c: c.get("purchase_value") or 0.0, reverse=True)[:max_count]
+
+
+def compute_top_management_signals(
+    findings: List[Dict[str, Any]], campaign_summaries: List[Dict[str, Any]], max_count: int = 3
+) -> List[Dict[str, Any]]:
+    """Top N findings (already severity/spend sorted) reframed as management signals."""
+    confidence_by_campaign = {c["campaign_id"]: c["decision_confidence"] for c in campaign_summaries}
+    return [
+        {
+            "signal": f["title"],
+            "business_implication": f["observation"],
+            "confidence": confidence_by_campaign.get(f["campaign_id"], "MEDIUM"),
+        }
+        for f in findings[:max_count]
+    ]
+
+
+def compute_management_decisions(
+    findings: List[Dict[str, Any]], campaign_summaries: List[Dict[str, Any]], max_count: int = 5
+) -> List[Dict[str, Any]]:
+    """Top N findings (already severity/spend sorted) reframed as required management decisions."""
+    confidence_by_campaign = {c["campaign_id"]: c["decision_confidence"] for c in campaign_summaries}
+    return [
+        {
+            "priority": f["severity"],
+            "decision": f["recommended_action"],
+            "evidence": f["observation"],
+            "commercial_implication": f["title"],
+            "confidence": confidence_by_campaign.get(f["campaign_id"], "MEDIUM"),
+        }
+        for f in findings[:max_count]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +1067,13 @@ def analyze(df: pd.DataFrame, account_currency: Optional[str] = None) -> Dict[st
         account_integrity_warnings, account_tracking_risk_present, account_sample_size_ok
     )
 
+    collected_period = get_collected_period(df)
+    current_funnel_stages = compute_funnel_stages(account_last7)
+    previous_funnel_stages = compute_funnel_stages(account_previous7)
+    biggest_funnel_leak = compute_biggest_funnel_leak(current_funnel_stages, previous_funnel_stages)
+    management_signals = compute_top_management_signals(all_findings, campaign_summaries)
+    management_decisions = compute_management_decisions(all_findings, campaign_summaries)
+
     return {
         "analysis_metadata": {
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -762,6 +1091,10 @@ def analyze(df: pd.DataFrame, account_currency: Optional[str] = None) -> Dict[st
             "integrity_warnings_generated": len(all_integrity_warnings) + len(account_integrity_warnings),
             "account_currency": account_currency,
         },
+        "collected_period": {
+            "min_date": collected_period["min_date"].isoformat(),
+            "max_date": collected_period["max_date"].isoformat(),
+        },
         "account_summary": {
             "last_7_days": account_last7,
             "previous_7_days": account_previous7,
@@ -773,6 +1106,13 @@ def analyze(df: pd.DataFrame, account_currency: Optional[str] = None) -> Dict[st
         },
         "findings": all_findings,
         "campaigns": campaign_summaries,
+        "funnel": {
+            "current_stages": current_funnel_stages,
+            "previous_stages": previous_funnel_stages,
+            "biggest_leak": biggest_funnel_leak,
+        },
+        "management_signals": management_signals,
+        "management_decisions": management_decisions,
     }
 
 

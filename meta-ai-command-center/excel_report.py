@@ -2,26 +2,34 @@
 """
 Excel workbook generator for the Meta Ads Performance Intelligence report.
 
-Builds meta_ads_performance_intelligence.xlsx from three already-generated,
-already-validated inputs:
+Builds meta_ads_performance_intelligence.xlsx -- a senior-management
+performance pack -- from three already-generated, already-validated inputs:
 
     data/meta_campaign_daily.csv       -- Layer 1 raw campaign daily data
     data/performance_findings.json     -- deterministic analysis (Layer 2)
-    reports/meta_performance_report.md -- Claude's executive markdown report
+    reports/meta_performance_report.md -- Claude's executive markdown brief
 
-This script performs its own aggregation for two presentation-only views
-(a full-period per-campaign rollup for the Campaign Performance sheet, and a
-full-period daily rollup for the dashboard's trend charts) but reuses
-performance_analyzer.py's existing aggregate_window()/safe_divide()/
-safe_pct_change() helpers rather than reimplementing that math -- every
-ratio in this workbook is computed exactly the same way as the rest of the
-pipeline. No metric definitions are duplicated or altered here.
+This script performs presentation-only aggregation (collected-period,
+monthly, weekly, and daily rollups; per-campaign collected-period totals)
+but reuses performance_analyzer.py's own aggregate_window()/safe_divide()/
+safe_pct_change()/funnel/decision helpers rather than reimplementing any
+metric definition or threshold -- every ratio and every decision label in
+this workbook traces back to that single deterministic module.
 
-The workbook contains exactly four worksheets, in this order:
-    1. Raw Data
-    2. Executive Dashboard
-    3. Campaign Performance
-    4. AI Analysis
+The workbook contains exactly seven worksheets, in this order:
+    1. Executive Cockpit
+    2. Lifetime Performance      (on-sheet title: "Collected Period Performance")
+    3. Marketing Funnel
+    4. Campaign Portfolio
+    5. Trend & Efficiency
+    6. AI Management Brief
+    7. Raw Data
+
+Website Landings (LPV) is read exclusively from Meta's own
+`landing_page_views` column (via performance_analyzer.aggregate_window()).
+Clicks are never substituted for it -- if LPV is unavailable, every
+LPV-derived cell/chart in this workbook shows "N/A" and is skipped, never
+zero.
 """
 
 import argparse
@@ -33,21 +41,85 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.chart import BarChart, LineChart, Reference, ScatterChart, Series
+from openpyxl.chart.marker import Marker
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from currency_utils import get_currency_excel_number_format
-from performance_analyzer import aggregate_window, safe_divide, safe_pct_change
+from currency_utils import format_currency_text, get_currency_excel_number_format
+from performance_analyzer import (
+    add_moving_averages,
+    aggregate_daily_metrics,
+    aggregate_monthly_totals,
+    aggregate_weekly_totals,
+    aggregate_window,
+    classify_portfolio_decision,
+    compute_biggest_funnel_leak,
+    compute_campaign_shares,
+    compute_funnel_stages,
+    compute_wasted_spend_candidates,
+    compute_top_sales_contributors,
+    get_collected_period,
+    safe_divide,
+    safe_pct_change,
+)
 
 DEFAULT_CSV_PATH = os.path.join("data", "meta_campaign_daily.csv")
 DEFAULT_FINDINGS_PATH = os.path.join("data", "performance_findings.json")
 DEFAULT_REPORT_PATH = os.path.join("reports", "meta_performance_report.md")
 DEFAULT_OUTPUT_PATH = "meta_ads_performance_intelligence.xlsx"
 
-REQUIRED_WORKSHEET_ORDER = ["Raw Data", "Executive Dashboard", "Campaign Performance", "AI Analysis"]
+REQUIRED_WORKSHEET_ORDER = [
+    "Executive Cockpit",
+    "Lifetime Performance",
+    "Marketing Funnel",
+    "Campaign Portfolio",
+    "Trend & Efficiency",
+    "AI Management Brief",
+    "Raw Data",
+]
+COLLECTED_PERIOD_SHEET_TITLE = "Collected Period Performance"
+
+# ---------------------------------------------------------------------------
+# Design system: restrained, board-ready. One header treatment, one positive,
+# one warning, one critical, one neutral status color -- nothing else.
+# ---------------------------------------------------------------------------
+HEADER_FILL = PatternFill("solid", fgColor="1F2937")   # dark charcoal/navy
+HEADER_FONT = Font(bold=True, color="FFFFFF")
+TITLE_FONT = Font(bold=True, size=17, color="1F2937")
+SUBTITLE_FONT = Font(italic=True, size=10, color="595959")
+NOTE_FONT = Font(italic=True, size=9, color="808080")
+SECTION_FONT = Font(bold=True, size=13, color="FFFFFF")
+
+POSITIVE_FILL = PatternFill("solid", fgColor="C6EFCE")
+WARNING_FILL = PatternFill("solid", fgColor="FFEB9C")
+CRITICAL_FILL = PatternFill("solid", fgColor="FFC7CE")
+NEUTRAL_FILL = PatternFill("solid", fgColor="D9D9D9")
+
+LINK_FONT = Font(color="0563C1", underline="single", bold=True)
+
+CHANGE_NUMBER_FORMAT = '+0.0"%";-0.0"%";0.0"%"'
+CALC_COL_OFFSET = 14  # chart source-data blocks live from column N onward
+
+AI_STATUS_FILLS = {
+    "TRACKING WARNING": CRITICAL_FILL,
+    "EFFICIENCY RISK": CRITICAL_FILL,
+    "CREATIVE FATIGUE": WARNING_FILL,
+    "SCALE": POSITIVE_FILL,
+    "MONITOR": NEUTRAL_FILL,
+    "INSUFFICIENT DATA": NEUTRAL_FILL,
+}
+PORTFOLIO_DECISION_FILLS = {
+    "SCALE": POSITIVE_FILL,
+    "PROTECT": POSITIVE_FILL,
+    "MAINTAIN": NEUTRAL_FILL,
+    "FIX": WARNING_FILL,
+    "CUT": CRITICAL_FILL,
+    "INVESTIGATE TRACKING": CRITICAL_FILL,
+    "INSUFFICIENT DATA": NEUTRAL_FILL,
+}
 
 # Columns exactly as produced by meta_collector.py's OUTPUT_COLUMNS. This
 # script does not assume any other schema for the raw CSV.
@@ -63,13 +135,12 @@ RAW_DATA_DATE_COLUMNS = {"date"}
 # Meta's raw `ctr` field is already a percent-number (e.g. 2.35 meaning
 # 2.35%), not a 0-1 fraction -- use a custom format that doesn't re-multiply
 # by 100. click_to_landing_page_rate / landing_page_to_purchase_rate are
-# true 0-1 fractions computed by meta_collector.py's own safe_divide, so
-# they use Excel's native percentage format.
+# true 0-1 fractions, so they use Excel's native percentage format.
 #
 # Currency columns (spend, purchase_value, cpc, cpm, CPA) are NOT listed
 # here -- their number_format is built dynamically per the account's actual
-# currency via get_currency_excel_number_format() (see RAW_DATA_CURRENCY_COLUMNS
-# below). This workbook never hardcodes "$"/USD.
+# currency via get_currency_excel_number_format(). This workbook never
+# hardcodes "$"/USD.
 RAW_DATA_NUMBER_FORMATS = {
     "impressions": '#,##0',
     "reach": '#,##0',
@@ -85,99 +156,6 @@ RAW_DATA_NUMBER_FORMATS = {
     "landing_page_to_purchase_rate": '0.0%',
 }
 RAW_DATA_CURRENCY_COLUMNS = {"spend", "purchase_value", "cpc", "cpm", "CPA"}
-
-CHANGE_NUMBER_FORMAT = '+0.0"%";-0.0"%";0.0"%"'
-
-HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
-HEADER_FONT = Font(bold=True, color="FFFFFF")
-GREEN_FILL = PatternFill("solid", fgColor="C6EFCE")
-RED_FILL = PatternFill("solid", fgColor="FFC7CE")
-ORANGE_FILL = PatternFill("solid", fgColor="FCE4D6")
-YELLOW_FILL = PatternFill("solid", fgColor="FFEB9C")
-GRAY_FILL = PatternFill("solid", fgColor="D9D9D9")
-
-# KPI definitions for the Executive Dashboard: (label, metric key in the
-# last_7_days/previous_7_days dicts, pct-change key, format type, direction).
-# direction=None means the metric is not treated as inherently good or bad
-# when it increases (e.g. spend) -- no conditional coloring is applied.
-KPI_DEFINITIONS = [
-    ("Total Spend", "spend", "spend_pct_change", "currency", None),
-    ("Purchase Value / Revenue", "purchase_value", "purchase_value_pct_change", "currency", "positive_increase"),
-    ("Purchases", "purchases", "purchases_pct_change", "integer", "positive_increase"),
-    ("ROAS", "roas", "roas_pct_change", "decimal", "positive_increase"),
-    ("CPA", "cpa", "cpa_pct_change", "currency", "negative_increase"),
-    ("CTR", "ctr", "ctr_pct_change", "true_fraction_percent", "positive_increase"),
-    ("CPC", "cpc", "cpc_pct_change", "currency", "negative_increase"),
-    ("CPM", "cpm", "cpm_pct_change", "currency", "negative_increase"),
-    ("Add to Carts", "add_to_carts", "add_to_carts_pct_change", "integer", "positive_increase"),
-    ("Initiated Checkouts", "initiated_checkouts", "initiated_checkouts_pct_change", "integer", "positive_increase"),
-    (
-        "Checkout to Purchase Rate",
-        "checkout_to_purchase_rate",
-        "checkout_to_purchase_rate_pct_change",
-        "true_fraction_percent",
-        "positive_increase",
-    ),
-]
-
-CAMPAIGN_PERFORMANCE_COLUMNS = [
-    "Campaign ID", "Campaign Name", "Objective", "Spend", "Impressions", "Clicks", "CTR", "CPC", "CPM",
-    "Purchases", "Purchase Value", "CPA", "ROAS", "Add to Carts", "Initiated Checkouts",
-    "Checkout to Purchase Rate", "Frequency", "AI Status",
-]
-# As with Raw Data, currency columns are formatted dynamically per the
-# account's actual currency (see CAMPAIGN_PERFORMANCE_CURRENCY_COLUMNS) --
-# never hardcoded here.
-CAMPAIGN_PERFORMANCE_NUMBER_FORMATS = {
-    "Impressions": '#,##0',
-    "Clicks": '#,##0',
-    "Purchases": '#,##0',
-    "Add to Carts": '#,##0',
-    "Initiated Checkouts": '#,##0',
-    "CTR": '0.0%',
-    "Checkout to Purchase Rate": '0.0%',
-    "ROAS": '0.00',
-    "Frequency": '0.00',
-}
-CAMPAIGN_PERFORMANCE_CURRENCY_COLUMNS = {"Spend", "Purchase Value", "CPC", "CPM", "CPA"}
-AI_STATUS_FILLS = {
-    "TRACKING WARNING": RED_FILL,
-    "EFFICIENCY RISK": ORANGE_FILL,
-    "CREATIVE FATIGUE": YELLOW_FILL,
-    "SCALE": GREEN_FILL,
-    "INSUFFICIENT DATA": GRAY_FILL,
-}
-
-# Calculation area (chart source data) lives in its own column block, well
-# separated from the KPI table and charts so it reads as a distinct section.
-CALC_COL_OFFSET = 10  # column J
-CHARTS_START_ROW = 18
-CHART_ROW_SPACING = 20
-
-REQUIRED_AI_ANALYSIS_SECTIONS = [
-    "EXECUTIVE SUMMARY",
-    "DATA INTEGRITY & DECISION CONFIDENCE",
-    "CRITICAL ISSUES",
-    "HIGH PRIORITY RISKS",
-    "SCALING OPPORTUNITIES",
-    "CREATIVE FATIGUE SIGNALS",
-    "FUNNEL ANALYSIS",
-    "CAMPAIGNS TO WATCH",
-    "NEXT 24 HOURS ACTION PLAN",
-]
-ACTION_SECTIONS = {
-    "CRITICAL ISSUES",
-    "HIGH PRIORITY RISKS",
-    "SCALING OPPORTUNITIES",
-    "CREATIVE FATIGUE SIGNALS",
-    "CAMPAIGNS TO WATCH",
-    "NEXT 24 HOURS ACTION PLAN",
-}
-RECOMMENDATION_FIELDS = ["Priority", "Decision Confidence", "Campaign", "Evidence", "Observation", "Recommended Action"]
-RECOMMENDATION_FIELD_PATTERN = re.compile(
-    r'^\**\s*(Priority|Decision Confidence|Campaign|Evidence|Observation|Recommended Action)\s*:\**\s*(.*)$',
-    re.IGNORECASE,
-)
 
 
 class ExcelReportError(Exception):
@@ -239,12 +217,7 @@ def load_ai_report(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def aggregate_campaign_totals(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Full-collected-period per-campaign rollup for the Campaign Performance sheet.
-
-    Ratios are derived from aggregated totals via performance_analyzer.py's
-    own aggregate_window(), exactly as the rest of the pipeline computes
-    them -- not reimplemented or averaged from daily ratios.
-    """
+    """Full-collected-period per-campaign rollup, used by Campaign Portfolio."""
     min_date = df["date"].min()
     max_date = df["date"].max()
     campaigns = df[["campaign_id", "campaign_name"]].drop_duplicates()
@@ -261,9 +234,9 @@ def aggregate_campaign_totals(df: pd.DataFrame) -> List[Dict[str, Any]]:
         objective = str(objective_series.iloc[0]) if not objective_series.empty else ""
 
         # Reach is not additive across days (it's per-day unique reach), so a
-        # true lifetime Frequency (impressions / unique reach) cannot be
-        # derived from summed daily reach. The arithmetic mean of the daily
-        # Frequency values is used as a pragmatic estimate instead.
+        # true collected-period Frequency (impressions / unique reach) cannot
+        # be derived from summed daily reach. The arithmetic mean of the
+        # daily Frequency values is used as a pragmatic estimate instead.
         frequency_series = pd.to_numeric(campaign_rows["frequency"], errors="coerce").dropna()
         frequency = float(frequency_series.mean()) if not frequency_series.empty else None
 
@@ -279,43 +252,12 @@ def aggregate_campaign_totals(df: pd.DataFrame) -> List[Dict[str, Any]]:
     return results
 
 
-def aggregate_daily_totals(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Full-period, account-wide daily rollup for the dashboard's trend charts."""
-    grouped = (
-        df.groupby("date")
-        .agg(
-            spend=("spend", "sum"),
-            purchase_value=("purchase_value", "sum"),
-            purchases=("purchases", "sum"),
-        )
-        .reset_index()
-        .sort_values("date")
-    )
-
-    results = []
-    for _, row in grouped.iterrows():
-        spend = float(row["spend"])
-        purchase_value = float(row["purchase_value"])
-        purchases = float(row["purchases"])
-        results.append(
-            {
-                "date": row["date"],
-                "spend": spend,
-                "purchase_value": purchase_value,
-                "roas": safe_divide(purchase_value, spend),
-                "cpa": safe_divide(spend, purchases),
-                "purchases": purchases,
-            }
-        )
-    return results
-
-
 # ---------------------------------------------------------------------------
-# Styling helpers
+# Styling / navigation / layout helpers
 # ---------------------------------------------------------------------------
 
-def style_header_row(ws, row_idx: int, num_cols: int) -> None:
-    for col in range(1, num_cols + 1):
+def style_header_row(ws, row_idx: int, num_cols: int, start_col: int = 1) -> None:
+    for col in range(start_col, start_col + num_cols):
         cell = ws.cell(row=row_idx, column=col)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
@@ -337,8 +279,1187 @@ def autosize_columns(ws, max_width: int = 32, min_width: int = 8) -> None:
         ws.column_dimensions[col_letter].width = min(max(length + 2, min_width), max_width)
 
 
+def hide_gridlines(ws) -> None:
+    ws.sheet_view.showGridLines = False
+
+
+def apply_print_settings(ws, landscape: bool = True) -> None:
+    ws.page_setup.orientation = "landscape" if landscape else "portrait"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+
+def add_sheet_title(ws, title: str, subtitle: str = "", end_column: int = 8) -> int:
+    ws.cell(row=1, column=1, value=title).font = TITLE_FONT
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=end_column)
+    if subtitle:
+        ws.cell(row=2, column=1, value=subtitle).font = SUBTITLE_FONT
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=end_column)
+    return 4
+
+
+def add_nav_bar(ws, current_sheet: str, row: int = 3) -> None:
+    """A single-row navigation strip linking to every other sheet."""
+    ws.cell(row=row, column=1, value="Go to:").font = Font(bold=True, size=9, color="595959")
+    col = 2
+    for sheet_name in REQUIRED_WORKSHEET_ORDER:
+        if sheet_name == current_sheet:
+            continue
+        cell = ws.cell(row=row, column=col, value=sheet_name)
+        cell.hyperlink = f"#'{sheet_name}'!A1"
+        cell.font = Font(color="0563C1", underline="single", size=9)
+        col += 1
+
+
+def add_back_link(ws, row: int = 1, column: int = 10) -> None:
+    cell = ws.cell(row=row, column=column, value="<< Back to Executive Cockpit")
+    cell.hyperlink = "#'Executive Cockpit'!A1"
+    cell.font = LINK_FONT
+
+
+def limit_words(text: str, max_words: int = 100) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]) + "…"
+
+
 # ---------------------------------------------------------------------------
-# Sheet 1: Raw Data
+# Chart helpers -- every chart is sourced from real worksheet cells written
+# into a dedicated "Chart Source Data" block, never from inline Python data.
+# ---------------------------------------------------------------------------
+
+def _add_line_chart(ws, title, y_title, cats_ref, data_ref, anchor, width=24, height=10, single_series=False):
+    chart = LineChart()
+    chart.title = title
+    chart.y_axis.title = y_title
+    chart.x_axis.title = "Date"
+    chart.add_data(data_ref, titles_from_data=True)
+    chart.set_categories(cats_ref)
+    chart.width = width
+    chart.height = height
+    if single_series:
+        chart.legend = None
+    ws.add_chart(chart, anchor)
+
+
+def _add_bar_chart(ws, title, x_title, y_title, cats_ref, data_ref, anchor, width=22, height=10, horizontal=False):
+    chart = BarChart()
+    chart.type = "bar" if horizontal else "col"
+    chart.title = title
+    chart.x_axis.title = x_title
+    chart.y_axis.title = y_title
+    chart.add_data(data_ref, titles_from_data=True)
+    chart.set_categories(cats_ref)
+    chart.width = width
+    chart.height = height
+    chart.legend = None
+    ws.add_chart(chart, anchor)
+
+
+def _add_scatter_chart(ws, title, x_title, y_title, x_ref, y_ref, anchor, width=22, height=12):
+    chart = ScatterChart()
+    chart.title = title
+    chart.x_axis.title = x_title
+    chart.y_axis.title = y_title
+    chart.style = 13
+    series = Series(y_ref, x_ref, title=title)
+    series.marker = Marker(symbol="circle", size=6)
+    series.graphicalProperties.line.noFill = True
+    chart.series.append(series)
+    chart.legend = None
+    chart.width = width
+    chart.height = height
+    ws.add_chart(chart, anchor)
+
+
+# ---------------------------------------------------------------------------
+# Sheet 1: Executive Cockpit
+# ---------------------------------------------------------------------------
+
+COCKPIT_KPI_DEFINITIONS = [
+    ("Collected Period Spend", "spend", "currency", None),
+    ("Collected Period Tracked Sales", "purchase_value", "currency", "positive_increase"),
+    ("ROAS", "roas", "decimal", "positive_increase"),
+    ("Purchases", "purchases", "integer", "positive_increase"),
+    ("CPA", "cpa", "currency", "negative_increase"),
+    ("Website Landings (LPV)", "landing_page_views", "integer", "positive_increase"),
+    ("Landing-to-Purchase CVR", "landing_page_to_purchase_rate", "true_fraction_percent", "positive_increase"),
+    ("Reach", "reach", "integer", None),
+]
+
+
+def _format_for_type(format_type: str, currency_code: Optional[str]) -> str:
+    if format_type == "currency":
+        return get_currency_excel_number_format(currency_code)
+    return {
+        "integer": '#,##0',
+        "decimal": '0.00',
+        "true_fraction_percent": '0.0%',
+    }[format_type]
+
+
+def _kpi_status(change: Optional[float], direction: Optional[str], account_confidence: str):
+    """Deterministic management status: never treats a raw increase as universally good."""
+    if change is None:
+        return "N/A", NEUTRAL_FILL
+    if account_confidence == "LOW":
+        return "WATCH (LOW CONFIDENCE)", WARNING_FILL
+    if direction is None:
+        return "NEUTRAL", NEUTRAL_FILL
+    is_good = (change > 0) if direction == "positive_increase" else (change < 0)
+    if change == 0:
+        return "FLAT", NEUTRAL_FILL
+    return ("ON TRACK", POSITIVE_FILL) if is_good else ("AT RISK", CRITICAL_FILL)
+
+
+def _direction_arrow(change: Optional[float]) -> str:
+    if change is None:
+        return "N/A"
+    if change > 0:
+        return "UP"
+    if change < 0:
+        return "DOWN"
+    return "FLAT"
+
+
+def build_kpi_cards(ws, last7: dict, previous7: dict, start_row: int, currency_code: Optional[str], account_confidence: str) -> int:
+    headers = ["Metric", "Current", "Previous", "% Change", "Direction", "Management Status"]
+    for i, header in enumerate(headers, start=1):
+        ws.cell(row=start_row, column=i, value=header)
+    style_header_row(ws, start_row, len(headers))
+
+    for offset, (label, metric_key, format_type, direction) in enumerate(COCKPIT_KPI_DEFINITIONS, start=1):
+        row = start_row + offset
+        fmt = _format_for_type(format_type, currency_code)
+        current_value = last7.get(metric_key)
+        previous_value = previous7.get(metric_key)
+        change = safe_pct_change(current_value, previous_value)
+
+        ws.cell(row=row, column=1, value=label)
+        cur_cell = ws.cell(row=row, column=2, value=current_value)
+        prev_cell = ws.cell(row=row, column=3, value=previous_value)
+        change_cell = ws.cell(row=row, column=4, value=change)
+        cur_cell.number_format = fmt
+        prev_cell.number_format = fmt
+        change_cell.number_format = CHANGE_NUMBER_FORMAT
+        ws.cell(row=row, column=5, value=_direction_arrow(change))
+
+        status_label, status_fill = _kpi_status(change, direction, account_confidence)
+        status_cell = ws.cell(row=row, column=6, value=status_label)
+        status_cell.fill = status_fill
+
+        if current_value is None:
+            for c in (1, 2, 3, 4, 5):
+                ws.cell(row=row, column=c, value="N/A" if c in (2, 3) else ws.cell(row=row, column=c).value)
+
+    return start_row + len(COCKPIT_KPI_DEFINITIONS)
+
+
+def build_executive_verdict(ws, start_row: int, verdict_text: str) -> int:
+    ws.cell(row=start_row, column=1, value="EXECUTIVE VERDICT").font = SECTION_FONT
+    ws.cell(row=start_row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=6)
+    row = start_row + 1
+    cell = ws.cell(row=row, column=1, value=limit_words(verdict_text, 100))
+    cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.merge_cells(start_row=row, start_column=1, end_row=row + 2, end_column=6)
+    ws.row_dimensions[row].height = 60
+    return row + 4
+
+
+def build_management_signals(ws, start_row: int, signals: List[Dict[str, Any]]) -> int:
+    ws.cell(row=start_row, column=1, value="TOP 3 MANAGEMENT SIGNALS").font = SECTION_FONT
+    ws.cell(row=start_row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=6)
+    row = start_row + 1
+    headers = ["Signal", "Business Implication", "Confidence"]
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=row, column=i, value=h)
+    ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=5)
+    style_header_row(ws, row, 1, start_col=1)
+    ws.cell(row=row, column=6, value="")
+    row += 1
+    if not signals:
+        ws.cell(row=row, column=1, value="No material evidence identified in the current deterministic findings.")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=6)
+        row += 1
+    for signal in signals[:3]:
+        ws.cell(row=row, column=1, value=signal["signal"])
+        impl_cell = ws.cell(row=row, column=2, value=signal["business_implication"])
+        impl_cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=5)
+        ws.cell(row=row, column=6, value=signal["confidence"])
+        ws.row_dimensions[row].height = 30
+        row += 1
+    return row + 1
+
+
+def build_decisions_required(ws, start_row: int, decisions: List[Dict[str, Any]]) -> int:
+    ws.cell(row=start_row, column=1, value="DECISIONS REQUIRED THIS WEEK").font = SECTION_FONT
+    ws.cell(row=start_row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=6)
+    row = start_row + 1
+    headers = ["Priority", "Decision", "Evidence", "Commercial Implication", "Confidence"]
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(headers))
+    row += 1
+    if not decisions:
+        ws.cell(row=row, column=1, value="No material evidence identified in the current deterministic findings.")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+        row += 1
+    for decision in decisions[:5]:
+        ws.cell(row=row, column=1, value=decision["priority"].upper())
+        ws.cell(row=row, column=2, value=decision["decision"]).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.cell(row=row, column=3, value=decision["evidence"]).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.cell(row=row, column=4, value=decision["commercial_implication"]).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.cell(row=row, column=5, value=decision["confidence"])
+        ws.row_dimensions[row].height = 32
+        row += 1
+    return row + 1
+
+
+def build_cockpit_chart_data(ws, start_row: int, daily_totals, funnel_stages, campaign_totals, currency_code) -> Dict[str, int]:
+    col = CALC_COL_OFFSET
+    row = start_row
+    currency_format = get_currency_excel_number_format(currency_code)
+
+    ws.cell(row=row, column=col, value="Chart Source Data (auto-generated -- do not edit)").font = Font(bold=True, size=12)
+    row += 2
+
+    daily_header_row = row
+    for i, header in enumerate(["Date", "Spend", "Tracked Sales", "ROAS", "CPA", "Purchases"]):
+        ws.cell(row=row, column=col + i, value=header)
+    style_header_row(ws, row, 6, start_col=col)
+    row += 1
+    daily_first = row
+    for entry in daily_totals:
+        ws.cell(row=row, column=col, value=entry["date"]).number_format = "YYYY-MM-DD"
+        ws.cell(row=row, column=col + 1, value=entry["spend"]).number_format = currency_format
+        ws.cell(row=row, column=col + 2, value=entry["purchase_value"]).number_format = currency_format
+        ws.cell(row=row, column=col + 3, value=entry["roas"]).number_format = '0.00'
+        ws.cell(row=row, column=col + 4, value=entry["cpa"]).number_format = currency_format
+        ws.cell(row=row, column=col + 5, value=entry["purchases"]).number_format = '#,##0'
+        row += 1
+    daily_last = row - 1
+    row += 2
+
+    funnel_header_row = row
+    ws.cell(row=row, column=col, value="Stage")
+    ws.cell(row=row, column=col + 1, value="Volume")
+    style_header_row(ws, row, 2, start_col=col)
+    row += 1
+    funnel_first = row
+    for stage in funnel_stages:
+        ws.cell(row=row, column=col, value=stage["stage"])
+        vol_cell = ws.cell(row=row, column=col + 1, value=stage["volume"])
+        vol_cell.number_format = '#,##0'
+        row += 1
+    funnel_last = row - 1
+    row += 2
+
+    spend_header_row = row
+    ws.cell(row=row, column=col, value="Campaign")
+    ws.cell(row=row, column=col + 1, value="Spend")
+    style_header_row(ws, row, 2, start_col=col)
+    row += 1
+    spend_first = row
+    top_by_spend = sorted(campaign_totals, key=lambda c: c.get("spend") or 0.0, reverse=True)[:10]
+    for entry in top_by_spend:
+        ws.cell(row=row, column=col, value=entry["campaign_name"])
+        ws.cell(row=row, column=col + 1, value=entry["spend"]).number_format = currency_format
+        row += 1
+    spend_last = row - 1
+    row += 2
+
+    sales_header_row = row
+    ws.cell(row=row, column=col, value="Campaign")
+    ws.cell(row=row, column=col + 1, value="Tracked Sales")
+    style_header_row(ws, row, 2, start_col=col)
+    row += 1
+    sales_first = row
+    top_by_sales = sorted(campaign_totals, key=lambda c: c.get("purchase_value") or 0.0, reverse=True)[:10]
+    for entry in top_by_sales:
+        ws.cell(row=row, column=col, value=entry["campaign_name"])
+        ws.cell(row=row, column=col + 1, value=entry["purchase_value"]).number_format = currency_format
+        row += 1
+    sales_last = row - 1
+
+    return {
+        "daily_header_row": daily_header_row, "daily_first": daily_first, "daily_last": daily_last,
+        "funnel_header_row": funnel_header_row, "funnel_first": funnel_first, "funnel_last": funnel_last,
+        "spend_header_row": spend_header_row, "spend_first": spend_first, "spend_last": spend_last,
+        "sales_header_row": sales_header_row, "sales_first": sales_first, "sales_last": sales_last,
+    }
+
+
+def build_executive_cockpit_sheet(wb: Workbook, findings: dict, daily_totals, campaign_totals, ai_sections: Dict[str, str]):
+    ws = wb.create_sheet("Executive Cockpit")
+    hide_gridlines(ws)
+    apply_print_settings(ws)
+    currency_code = findings.get("analysis_metadata", {}).get("account_currency")
+    account_confidence = findings["account_integrity"]["decision_confidence"]
+    meta = findings["analysis_metadata"]
+
+    subtitle = (
+        f"Reporting Window: {meta['last_7_day_window']['start']} to {meta['last_7_day_window']['end']}   |   "
+        f"Previous Comparable Period: {meta['previous_7_day_window']['start']} to {meta['previous_7_day_window']['end']}   |   "
+        f"Account Decision Confidence: {account_confidence}"
+    )
+    row = add_sheet_title(ws, "Meta Ads Performance Intelligence -- Executive Cockpit", subtitle)
+    add_nav_bar(ws, "Executive Cockpit", row=row)
+    row += 2
+
+    last7 = findings["account_summary"]["last_7_days"]
+    previous7 = findings["account_summary"]["previous_7_days"]
+    row = build_kpi_cards(ws, last7, previous7, row, currency_code, account_confidence)
+    row += 1
+
+    row = build_executive_verdict(ws, row, ai_sections.get("EXECUTIVE VERDICT", ""))
+    row = build_management_signals(ws, row, findings.get("management_signals", []))
+    row = build_decisions_required(ws, row, findings.get("management_decisions", []))
+
+    funnel_stages = compute_funnel_stages(last7)
+    layout = build_cockpit_chart_data(ws, 1, daily_totals, funnel_stages, campaign_totals, currency_code)
+
+    charts_start_row = row + 2
+    spacing = 20
+    anchor_row = charts_start_row
+
+    daily_first, daily_last = layout["daily_first"], layout["daily_last"]
+    if daily_last >= daily_first:
+        cats_ref = Reference(ws, min_col=CALC_COL_OFFSET, min_row=daily_first, max_row=daily_last)
+        spend_sales_ref = Reference(
+            ws, min_col=CALC_COL_OFFSET + 1, max_col=CALC_COL_OFFSET + 2,
+            min_row=layout["daily_header_row"], max_row=daily_last,
+        )
+        _add_line_chart(ws, "Spend vs Tracked Sales Trend", "Amount", cats_ref, spend_sales_ref, f"A{anchor_row}", width=26, height=11)
+        anchor_row += spacing
+        roas_ref = Reference(ws, min_col=CALC_COL_OFFSET + 3, max_col=CALC_COL_OFFSET + 3, min_row=layout["daily_header_row"], max_row=daily_last)
+        _add_line_chart(ws, "ROAS Trend", "ROAS", cats_ref, roas_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+        cpa_ref = Reference(ws, min_col=CALC_COL_OFFSET + 4, max_col=CALC_COL_OFFSET + 4, min_row=layout["daily_header_row"], max_row=daily_last)
+        _add_line_chart(ws, "CPA Trend", "CPA", cats_ref, cpa_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+        purchases_ref = Reference(ws, min_col=CALC_COL_OFFSET + 5, max_col=CALC_COL_OFFSET + 5, min_row=layout["daily_header_row"], max_row=daily_last)
+        _add_line_chart(ws, "Purchases Trend", "Purchases", cats_ref, purchases_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+
+    if layout["funnel_last"] >= layout["funnel_first"]:
+        funnel_cats = Reference(ws, min_col=CALC_COL_OFFSET, min_row=layout["funnel_first"], max_row=layout["funnel_last"])
+        funnel_data = Reference(ws, min_col=CALC_COL_OFFSET + 1, min_row=layout["funnel_header_row"], max_row=layout["funnel_last"])
+        _add_bar_chart(ws, "Marketing Funnel (Last 7 Days)", "Stage", "Count", funnel_cats, funnel_data, f"A{anchor_row}", horizontal=True, height=12)
+        anchor_row += spacing
+
+    if layout["spend_last"] >= layout["spend_first"]:
+        spend_cats = Reference(ws, min_col=CALC_COL_OFFSET, min_row=layout["spend_first"], max_row=layout["spend_last"])
+        spend_data = Reference(ws, min_col=CALC_COL_OFFSET + 1, min_row=layout["spend_header_row"], max_row=layout["spend_last"])
+        _add_bar_chart(ws, "Top Campaign Spend Concentration", "Campaign", "Spend", spend_cats, spend_data, f"A{anchor_row}", horizontal=True)
+        anchor_row += spacing
+
+    if layout["sales_last"] >= layout["sales_first"]:
+        sales_cats = Reference(ws, min_col=CALC_COL_OFFSET, min_row=layout["sales_first"], max_row=layout["sales_last"])
+        sales_data = Reference(ws, min_col=CALC_COL_OFFSET + 1, min_row=layout["sales_header_row"], max_row=layout["sales_last"])
+        _add_bar_chart(ws, "Top Campaigns by Tracked Sales", "Campaign", "Tracked Sales", sales_cats, sales_data, f"A{anchor_row}", horizontal=True)
+
+    autosize_columns(ws, max_width=30)
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Sheet 2: Lifetime Performance (on-sheet title: "Collected Period Performance")
+# ---------------------------------------------------------------------------
+
+COLLECTED_PERIOD_METRICS = [
+    ("Total Spend", "spend", "currency"),
+    ("Total Tracked Purchase Value", "purchase_value", "currency"),
+    ("Total Purchases", "purchases", "integer"),
+    ("Total Impressions", "impressions", "integer"),
+    ("Total Reach", "reach", "integer"),
+    ("Total Clicks", "clicks", "integer"),
+    ("Website Landings (LPV)", "landing_page_views", "integer"),
+    ("Add to Carts", "add_to_carts", "integer"),
+    ("Initiated Checkouts", "initiated_checkouts", "integer"),
+    ("ROAS", "roas", "decimal"),
+    ("CPA", "cpa", "currency"),
+    ("CTR", "ctr", "true_fraction_percent"),
+    ("CPC", "cpc", "currency"),
+    ("CPM", "cpm", "currency"),
+    ("Click-to-Landing Rate", "click_to_landing_page_rate", "true_fraction_percent"),
+    ("Landing-to-Purchase CVR", "landing_page_to_purchase_rate", "true_fraction_percent"),
+]
+
+MONTHLY_TABLE_COLUMNS = [
+    ("Month", "month"), ("Spend", "spend"), ("Tracked Sales", "purchase_value"), ("ROAS", "roas"),
+    ("Purchases", "purchases"), ("CPA", "cpa"), ("Impressions", "impressions"), ("Reach", "reach"),
+    ("Clicks", "clicks"), ("LPV", "landing_page_views"), ("CTR", "ctr"), ("CPC", "cpc"), ("CPM", "cpm"),
+]
+
+
+def build_collected_period_sheet(wb: Workbook, df: pd.DataFrame, findings: dict, campaign_totals):
+    ws = wb.create_sheet("Lifetime Performance")
+    hide_gridlines(ws)
+    apply_print_settings(ws)
+    currency_code = findings.get("analysis_metadata", {}).get("account_currency")
+    period = get_collected_period(df)
+
+    subtitle = (
+        f"Data available from: {period['min_date'].isoformat()}   |   Data available to: {period['max_date'].isoformat()}"
+    )
+    row = add_sheet_title(ws, COLLECTED_PERIOD_SHEET_TITLE, subtitle)
+    add_nav_bar(ws, "Lifetime Performance", row=row)
+    add_back_link(ws, row=1, column=10)
+    row += 1
+
+    note = (
+        "Collected-period totals represent all data available in this reporting dataset and may "
+        "not represent the full lifetime of the Meta ad account."
+    )
+    ws.cell(row=row, column=1, value=note).font = NOTE_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+    row += 2
+
+    account_totals = aggregate_window(df, period["min_date"], period["max_date"])
+
+    ws.cell(row=row, column=1, value="COLLECTED-PERIOD TOTALS").font = SECTION_FONT
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+    row += 1
+    totals_start_row = row
+    for label, key, fmt_type in COLLECTED_PERIOD_METRICS:
+        value = account_totals.get(key)
+        ws.cell(row=row, column=1, value=label)
+        value_cell = ws.cell(row=row, column=2, value=value if value is not None else "N/A")
+        if value is not None:
+            value_cell.number_format = _format_for_type(fmt_type, currency_code)
+        row += 1
+    row += 1
+
+    monthly = aggregate_monthly_totals(df)
+    ws.cell(row=row, column=1, value="MONTHLY PERFORMANCE").font = SECTION_FONT
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(MONTHLY_TABLE_COLUMNS))
+    row += 1
+    monthly_header_row = row
+    for i, (label, _) in enumerate(MONTHLY_TABLE_COLUMNS, start=1):
+        ws.cell(row=row, column=i, value=label)
+    style_header_row(ws, row, len(MONTHLY_TABLE_COLUMNS))
+    row += 1
+    monthly_first_row = row
+    currency_format = get_currency_excel_number_format(currency_code)
+    for entry in monthly:
+        for i, (_, key) in enumerate(MONTHLY_TABLE_COLUMNS, start=1):
+            value = entry.get(key)
+            cell = ws.cell(row=row, column=i, value=value if value is not None else "N/A")
+            if key in ("spend", "purchase_value", "cpa", "cpc", "cpm") and value is not None:
+                cell.number_format = currency_format
+            elif key in ("purchases", "impressions", "reach", "clicks", "landing_page_views") and value is not None:
+                cell.number_format = '#,##0'
+            elif key == "roas" and value is not None:
+                cell.number_format = '0.00'
+            elif key == "ctr" and value is not None:
+                cell.number_format = '0.00"%"'
+        row += 1
+    monthly_last_row = row - 1
+    row += 2
+
+    # Chart source columns for the monthly charts, sourced from the monthly
+    # table itself (real cells, not inline data).
+    charts_start_row = row + 2
+    spacing = 20
+    anchor_row = charts_start_row
+
+    def month_col(key: str) -> int:
+        return next(i for i, (_, k) in enumerate(MONTHLY_TABLE_COLUMNS, start=1) if k == key)
+
+    if monthly_last_row >= monthly_first_row:
+        cats_ref = Reference(ws, min_col=month_col("month"), min_row=monthly_first_row, max_row=monthly_last_row)
+        spend_sales_ref = Reference(
+            ws, min_col=month_col("spend"), max_col=month_col("purchase_value"),
+            min_row=monthly_header_row, max_row=monthly_last_row,
+        )
+        _add_line_chart(ws, "Monthly Spend vs Tracked Sales", "Amount", cats_ref, spend_sales_ref, f"A{anchor_row}", width=26, height=11)
+        anchor_row += spacing
+
+        roas_ref = Reference(ws, min_col=month_col("roas"), max_col=month_col("roas"), min_row=monthly_header_row, max_row=monthly_last_row)
+        _add_line_chart(ws, "Monthly ROAS", "ROAS", cats_ref, roas_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+
+        cpa_ref = Reference(ws, min_col=month_col("cpa"), max_col=month_col("cpa"), min_row=monthly_header_row, max_row=monthly_last_row)
+        _add_line_chart(ws, "Monthly CPA", "CPA", cats_ref, cpa_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+
+        purchases_ref = Reference(ws, min_col=month_col("purchases"), max_col=month_col("purchases"), min_row=monthly_header_row, max_row=monthly_last_row)
+        _add_line_chart(ws, "Monthly Purchases", "Purchases", cats_ref, purchases_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+
+        # LPV-derived charts are only created when at least one month has a
+        # real (non-None) LPV value -- never a fake zero chart.
+        if any(entry.get("landing_page_views") is not None for entry in monthly):
+            lpv_ref = Reference(ws, min_col=month_col("landing_page_views"), max_col=month_col("landing_page_views"), min_row=monthly_header_row, max_row=monthly_last_row)
+            _add_line_chart(ws, "Monthly Website Landings (LPV)", "LPV", cats_ref, lpv_ref, f"A{anchor_row}", single_series=True)
+            anchor_row += spacing
+
+        # Landing-to-Purchase CVR isn't a monthly-table column; only add its
+        # chart if the underlying rate could be computed from real data.
+        cvr_values = [safe_divide(e.get("purchases"), e.get("landing_page_views")) for e in monthly]
+        if any(v is not None for v in cvr_values):
+            cvr_col = len(MONTHLY_TABLE_COLUMNS) + 1
+            ws.cell(row=monthly_header_row, column=cvr_col, value="Landing-to-Purchase CVR")
+            style_header_row(ws, monthly_header_row, 1, start_col=cvr_col)
+            for offset, v in enumerate(cvr_values):
+                cell = ws.cell(row=monthly_first_row + offset, column=cvr_col, value=v)
+                cell.number_format = '0.0%'
+            cvr_ref = Reference(ws, min_col=cvr_col, max_col=cvr_col, min_row=monthly_header_row, max_row=monthly_last_row)
+            _add_line_chart(ws, "Monthly Landing-to-Purchase CVR", "CVR", cats_ref, cvr_ref, f"A{anchor_row}", single_series=True)
+
+    autosize_columns(ws, max_width=26)
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Sheet 3: Marketing Funnel
+# ---------------------------------------------------------------------------
+
+def build_marketing_funnel_sheet(wb: Workbook, findings: dict):
+    ws = wb.create_sheet("Marketing Funnel")
+    hide_gridlines(ws)
+    apply_print_settings(ws)
+
+    row = add_sheet_title(ws, "Marketing Funnel -- Impressions to Purchase")
+    add_nav_bar(ws, "Marketing Funnel", row=row)
+    add_back_link(ws, row=1, column=10)
+    row += 1
+
+    current_stages = findings["funnel"]["current_stages"]
+    previous_stages = findings["funnel"]["previous_stages"]
+    biggest_leak = findings["funnel"]["biggest_leak"]
+
+    headers = [
+        "Stage", "Volume", "Stage Conversion Rate", "Previous Period Conversion Rate",
+        "Change", "Drop-off Rate", "Management Status", "Formula",
+    ]
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(headers))
+    row += 1
+    table_first_row = row
+    for cur, prev in zip(current_stages, previous_stages):
+        rate = cur["stage_conversion_rate"]
+        prev_rate = prev.get("stage_conversion_rate")
+        change = safe_pct_change(rate, prev_rate)
+        ws.cell(row=row, column=1, value=cur["stage"])
+        vol_cell = ws.cell(row=row, column=2, value=cur["volume"] if cur["volume"] is not None else "N/A")
+        if cur["volume"] is not None:
+            vol_cell.number_format = '#,##0'
+        rate_cell = ws.cell(row=row, column=3, value=rate if rate is not None else "N/A")
+        if rate is not None:
+            rate_cell.number_format = '0.0%'
+        prev_rate_cell = ws.cell(row=row, column=4, value=prev_rate if prev_rate is not None else "N/A")
+        if prev_rate is not None:
+            prev_rate_cell.number_format = '0.0%'
+        change_cell = ws.cell(row=row, column=5, value=change if change is not None else "N/A")
+        if change is not None:
+            change_cell.number_format = CHANGE_NUMBER_FORMAT
+        drop_off = cur["drop_off_rate"]
+        drop_cell = ws.cell(row=row, column=6, value=drop_off if drop_off is not None else "N/A")
+        if drop_off is not None:
+            drop_cell.number_format = '0.0%'
+            status = "HEALTHY" if drop_off < 0.6 else ("WATCH" if drop_off < 0.85 else "AT RISK")
+            fill = POSITIVE_FILL if status == "HEALTHY" else (WARNING_FILL if status == "WATCH" else CRITICAL_FILL)
+        else:
+            status, fill = "N/A", NEUTRAL_FILL
+        status_cell = ws.cell(row=row, column=7, value=status)
+        status_cell.fill = fill
+        formula_cell = ws.cell(row=row, column=8, value=cur["formula"])
+        formula_cell.alignment = Alignment(wrap_text=True)
+        row += 1
+    table_last_row = row - 1
+    row += 2
+
+    cats_ref = Reference(ws, min_col=1, min_row=table_first_row, max_row=table_last_row)
+    data_ref = Reference(ws, min_col=2, max_col=2, min_row=table_first_row - 1, max_row=table_last_row)
+    _add_bar_chart(ws, "Marketing Funnel -- Collected Period", "Stage", "Volume", cats_ref, data_ref, f"A{row}", horizontal=True, height=14)
+    row += 20
+
+    ws.cell(row=row, column=1, value="BIGGEST FUNNEL LEAK").font = SECTION_FONT
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    row += 1
+    leak_headers = ["Stage", "Current Conversion", "Previous Conversion", "Movement", "Commercial Implication"]
+    for i, h in enumerate(leak_headers, start=1):
+        ws.cell(row=row, column=i, value=h)
+    style_header_row(ws, row, len(leak_headers))
+    row += 1
+    if biggest_leak:
+        ws.cell(row=row, column=1, value=biggest_leak["stage"])
+        cur_cell = ws.cell(row=row, column=2, value=biggest_leak["current_conversion_rate"])
+        cur_cell.number_format = '0.0%'
+        prev_val = biggest_leak["previous_conversion_rate"]
+        prev_cell = ws.cell(row=row, column=3, value=prev_val if prev_val is not None else "N/A")
+        if prev_val is not None:
+            prev_cell.number_format = '0.0%'
+        movement = biggest_leak["movement_pct"]
+        move_cell = ws.cell(row=row, column=4, value=movement if movement is not None else "N/A")
+        if movement is not None:
+            move_cell.number_format = CHANGE_NUMBER_FORMAT
+        ws.cell(
+            row=row, column=5,
+            value=(
+                f"{biggest_leak['stage']} is the weakest step in the funnel this period -- "
+                "prioritize investigation here before allocating incremental budget."
+            ),
+        ).alignment = Alignment(wrap_text=True)
+    else:
+        ws.cell(row=row, column=1, value="No material evidence identified in the current deterministic findings.")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    row += 2
+
+    ws.cell(row=row, column=1, value="TRACKING INTEGRITY WARNINGS").font = SECTION_FONT
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    row += 1
+    ws.cell(
+        row=row, column=1,
+        value=(
+            "Tracking anomalies below are data-quality signals, not campaign performance "
+            "problems -- they must be validated before drawing funnel conclusions."
+        ),
+    ).font = NOTE_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    row += 1
+    warnings = findings.get("account_integrity", {}).get("warnings", [])
+    if not warnings:
+        ws.cell(row=row, column=1, value="No material evidence identified in the current deterministic findings.")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+        row += 1
+    for warning in warnings:
+        cell = ws.cell(row=row, column=1, value=f"[{warning['severity'].upper()}] {warning['message']}")
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+        ws.row_dimensions[row].height = 32
+        row += 1
+
+    autosize_columns(ws, max_width=32)
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Sheet 4: Campaign Portfolio
+# ---------------------------------------------------------------------------
+
+CAMPAIGN_PORTFOLIO_COLUMNS = [
+    "Campaign", "Campaign ID", "Spend", "Tracked Sales", "ROAS", "Purchases", "CPA", "Impressions",
+    "Reach", "Clicks", "LPV", "CTR", "CPC", "CPM", "Landing-to-Purchase CVR",
+    "Spend Share", "Sales Share", "AI Status", "Decision", "Decision Confidence",
+]
+CAMPAIGN_PORTFOLIO_CURRENCY_COLUMNS = {"Spend", "Tracked Sales", "CPA", "CPC", "CPM"}
+CAMPAIGN_PORTFOLIO_INTEGER_COLUMNS = {"Purchases", "Impressions", "Reach", "Clicks", "LPV"}
+CAMPAIGN_PORTFOLIO_PERCENT_COLUMNS = {"CTR", "Landing-to-Purchase CVR", "Spend Share", "Sales Share"}
+
+
+def build_campaign_portfolio_sheet(wb: Workbook, campaign_totals, findings: dict):
+    ws = wb.create_sheet("Campaign Portfolio")
+    hide_gridlines(ws)
+    apply_print_settings(ws)
+    currency_code = findings.get("analysis_metadata", {}).get("account_currency")
+
+    row = add_sheet_title(ws, "Campaign Portfolio -- Management Decisions")
+    add_nav_bar(ws, "Campaign Portfolio", row=row)
+    add_back_link(ws, row=1, column=10)
+    row += 2
+
+    confidence_by_campaign = {c["campaign_id"]: c["decision_confidence"] for c in findings.get("campaigns", [])}
+    ai_status_by_campaign = {c["campaign_id"]: c["ai_status"] for c in findings.get("campaigns", [])}
+
+    for entry in campaign_totals:
+        confidence = confidence_by_campaign.get(entry["campaign_id"], "MEDIUM")
+        entry["decision_confidence"] = confidence
+        entry["decision"] = classify_portfolio_decision(entry.get("spend"), entry.get("purchases"), entry.get("roas"), confidence)
+        entry["ai_status"] = ai_status_by_campaign.get(entry["campaign_id"], "MONITOR")
+
+    for i, header in enumerate(CAMPAIGN_PORTFOLIO_COLUMNS, start=1):
+        ws.cell(row=row, column=i, value=header)
+    style_header_row(ws, row, len(CAMPAIGN_PORTFOLIO_COLUMNS))
+    row += 1
+    table_header_row = row - 1
+    table_start_row = row
+
+    currency_format = get_currency_excel_number_format(currency_code)
+    sorted_totals = sorted(campaign_totals, key=lambda c: c.get("spend") or 0.0, reverse=True)
+    for entry in sorted_totals:
+        values = [
+            entry["campaign_name"], entry["campaign_id"], entry["spend"], entry["purchase_value"],
+            entry["roas"], entry["purchases"], entry["cpa"], entry["impressions"], entry["reach"],
+            entry["clicks"], entry["landing_page_views"], entry["ctr"], entry["cpc"], entry["cpm"],
+            entry["landing_page_to_purchase_rate"], entry["spend_share"], entry["sales_share"],
+            entry["ai_status"], entry["decision"], entry["decision_confidence"],
+        ]
+        ws.append(["N/A" if v is None else v for v in values])
+    table_last_row = ws.max_row
+
+    col_index = {name: idx + 1 for idx, name in enumerate(CAMPAIGN_PORTFOLIO_COLUMNS)}
+    for r in range(table_start_row, table_last_row + 1):
+        ws.cell(row=r, column=col_index["Campaign ID"]).number_format = "@"
+    for col_name in CAMPAIGN_PORTFOLIO_CURRENCY_COLUMNS:
+        c_idx = col_index[col_name]
+        for r in range(table_start_row, table_last_row + 1):
+            if isinstance(ws.cell(row=r, column=c_idx).value, (int, float)):
+                ws.cell(row=r, column=c_idx).number_format = currency_format
+    for col_name in CAMPAIGN_PORTFOLIO_INTEGER_COLUMNS:
+        c_idx = col_index[col_name]
+        for r in range(table_start_row, table_last_row + 1):
+            if isinstance(ws.cell(row=r, column=c_idx).value, (int, float)):
+                ws.cell(row=r, column=c_idx).number_format = '#,##0'
+    for col_name in CAMPAIGN_PORTFOLIO_PERCENT_COLUMNS:
+        c_idx = col_index[col_name]
+        for r in range(table_start_row, table_last_row + 1):
+            if isinstance(ws.cell(row=r, column=c_idx).value, (int, float)):
+                ws.cell(row=r, column=c_idx).number_format = '0.0%'
+    roas_idx = col_index["ROAS"]
+    for r in range(table_start_row, table_last_row + 1):
+        if isinstance(ws.cell(row=r, column=roas_idx).value, (int, float)):
+            ws.cell(row=r, column=roas_idx).number_format = '0.00'
+
+    ws.freeze_panes = ws.cell(row=table_start_row, column=1).coordinate
+    last_col_letter = get_column_letter(len(CAMPAIGN_PORTFOLIO_COLUMNS))
+    table = Table(displayName="CampaignPortfolioTable", ref=f"A{table_header_row}:{last_col_letter}{table_last_row}")
+    table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
+    ws.add_table(table)
+
+    if table_last_row >= table_start_row:
+        status_col_letter = get_column_letter(col_index["Decision"])
+        status_range = f"{status_col_letter}{table_start_row}:{status_col_letter}{table_last_row}"
+        for decision, fill in PORTFOLIO_DECISION_FILLS.items():
+            ws.conditional_formatting.add(status_range, CellIsRule(operator="equal", formula=[f'"{decision}"'], fill=fill))
+        ai_status_col_letter = get_column_letter(col_index["AI Status"])
+        ai_status_range = f"{ai_status_col_letter}{table_start_row}:{ai_status_col_letter}{table_last_row}"
+        for status, fill in AI_STATUS_FILLS.items():
+            ws.conditional_formatting.add(ai_status_range, CellIsRule(operator="equal", formula=[f'"{status}"'], fill=fill))
+
+    row = table_last_row + 3
+    chart_col = CALC_COL_OFFSET
+    ws.cell(row=1, column=chart_col, value="Chart Source Data (auto-generated -- do not edit)").font = Font(bold=True, size=12)
+    chart_row = 3
+
+    spend_col_idx = col_index["Spend"]
+    sales_col_idx = col_index["Tracked Sales"]
+    x_ref = Reference(ws, min_col=spend_col_idx, min_row=table_start_row, max_row=table_last_row)
+    y_ref = Reference(ws, min_col=sales_col_idx, min_row=table_start_row, max_row=table_last_row)
+    anchor_row = row
+    if table_last_row >= table_start_row:
+        _add_scatter_chart(ws, "Spend vs Tracked Sales by Campaign", "Spend", "Tracked Sales", x_ref, y_ref, f"A{anchor_row}")
+        anchor_row += 22
+
+    top10 = sorted_totals[:10]
+    if top10:
+        top10_start = chart_row + 1
+        ws.cell(row=chart_row, column=chart_col, value="Campaign")
+        ws.cell(row=chart_row, column=chart_col + 1, value="ROAS")
+        ws.cell(row=chart_row, column=chart_col + 2, value="CPA")
+        ws.cell(row=chart_row, column=chart_col + 3, value="Spend Share")
+        ws.cell(row=chart_row, column=chart_col + 4, value="Sales Share")
+        style_header_row(ws, chart_row, 5, start_col=chart_col)
+        r = top10_start
+        for entry in top10:
+            ws.cell(row=r, column=chart_col, value=entry["campaign_name"])
+            ws.cell(row=r, column=chart_col + 1, value=entry["roas"] if entry["roas"] is not None else 0).number_format = '0.00'
+            ws.cell(row=r, column=chart_col + 2, value=entry["cpa"] if entry["cpa"] is not None else 0).number_format = currency_format
+            ws.cell(row=r, column=chart_col + 3, value=entry["spend_share"] if entry["spend_share"] is not None else 0).number_format = '0.0%'
+            ws.cell(row=r, column=chart_col + 4, value=entry["sales_share"] if entry["sales_share"] is not None else 0).number_format = '0.0%'
+            r += 1
+        top10_last = r - 1
+
+        cats_ref = Reference(ws, min_col=chart_col, min_row=top10_start, max_row=top10_last)
+        roas_ref = Reference(ws, min_col=chart_col + 1, max_col=chart_col + 1, min_row=chart_row, max_row=top10_last)
+        _add_bar_chart(ws, "ROAS by Campaign -- Top 10 by Spend", "Campaign", "ROAS", cats_ref, roas_ref, f"A{anchor_row}", horizontal=True)
+        anchor_row += 20
+        cpa_ref = Reference(ws, min_col=chart_col + 2, max_col=chart_col + 2, min_row=chart_row, max_row=top10_last)
+        _add_bar_chart(ws, "CPA by Campaign -- Top 10 by Spend", "Campaign", "CPA", cats_ref, cpa_ref, f"A{anchor_row}", horizontal=True)
+        anchor_row += 20
+        share_ref = Reference(ws, min_col=chart_col + 3, max_col=chart_col + 4, min_row=chart_row, max_row=top10_last)
+        _add_bar_chart(ws, "Spend Share vs Sales Share", "Campaign", "Share", cats_ref, share_ref, f"A{anchor_row}", horizontal=True)
+        anchor_row += 20
+
+    contributors = compute_top_sales_contributors(campaign_totals, max_count=10)
+    if contributors:
+        contrib_header = chart_row
+        contrib_col = chart_col + 6
+        ws.cell(row=contrib_header, column=contrib_col, value="Campaign")
+        ws.cell(row=contrib_header, column=contrib_col + 1, value="Tracked Sales")
+        style_header_row(ws, contrib_header, 2, start_col=contrib_col)
+        r = contrib_header + 1
+        for entry in contributors:
+            ws.cell(row=r, column=contrib_col, value=entry["campaign_name"])
+            ws.cell(row=r, column=contrib_col + 1, value=entry["purchase_value"]).number_format = currency_format
+            r += 1
+        contrib_last = r - 1
+        cats_ref = Reference(ws, min_col=contrib_col, min_row=contrib_header + 1, max_row=contrib_last)
+        data_ref = Reference(ws, min_col=contrib_col + 1, max_col=contrib_col + 1, min_row=contrib_header, max_row=contrib_last)
+        _add_bar_chart(ws, "Top 10 Tracked Sales Contributors", "Campaign", "Tracked Sales", cats_ref, data_ref, f"A{anchor_row}", horizontal=True)
+        anchor_row += 20
+
+    wasted = compute_wasted_spend_candidates(campaign_totals)
+    if wasted:
+        wasted_header = chart_row
+        wasted_col = chart_col + 9
+        ws.cell(row=wasted_header, column=wasted_col, value="Campaign")
+        ws.cell(row=wasted_header, column=wasted_col + 1, value="Wasted Spend")
+        style_header_row(ws, wasted_header, 2, start_col=wasted_col)
+        r = wasted_header + 1
+        for entry in sorted(wasted, key=lambda c: c.get("spend") or 0.0, reverse=True)[:10]:
+            ws.cell(row=r, column=wasted_col, value=entry["campaign_name"])
+            ws.cell(row=r, column=wasted_col + 1, value=entry["spend"]).number_format = currency_format
+            r += 1
+        wasted_last = r - 1
+        cats_ref = Reference(ws, min_col=wasted_col, min_row=wasted_header + 1, max_row=wasted_last)
+        data_ref = Reference(ws, min_col=wasted_col + 1, max_col=wasted_col + 1, min_row=wasted_header, max_row=wasted_last)
+        _add_bar_chart(ws, "Top 10 Wasted Spend Campaigns", "Campaign", "Wasted Spend", cats_ref, data_ref, f"A{anchor_row}", horizontal=True)
+
+    autosize_columns(ws, max_width=26)
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Sheet 5: Trend & Efficiency
+# ---------------------------------------------------------------------------
+
+DAILY_TABLE_COLUMNS = [
+    ("Date", "date"), ("Spend", "spend"), ("Tracked Sales", "purchase_value"), ("ROAS", "roas"),
+    ("Purchases", "purchases"), ("CPA", "cpa"), ("CTR", "ctr"), ("CPC", "cpc"), ("CPM", "cpm"),
+    ("LPV", "landing_page_views"), ("Click-to-Landing Rate", "click_to_landing_page_rate"),
+    ("Landing-to-Purchase CVR", "landing_page_to_purchase_rate"),
+]
+WEEKLY_TABLE_COLUMNS = [
+    ("Week Start", "week_start"), ("Spend", "spend"), ("Tracked Sales", "purchase_value"), ("ROAS", "roas"),
+    ("Purchases", "purchases"), ("CPA", "cpa"), ("CTR", "ctr"), ("CPC", "cpc"), ("CPM", "cpm"),
+    ("LPV", "landing_page_views"),
+]
+MOVING_AVERAGE_KEYS = ["roas", "cpa", "ctr", "cpc", "cpm", "landing_page_views", "landing_page_to_purchase_rate"]
+
+
+def _write_metric_column(ws, row, col, key, value, currency_code):
+    currency_format = get_currency_excel_number_format(currency_code)
+    if value is None:
+        ws.cell(row=row, column=col, value="N/A")
+        return
+    cell = ws.cell(row=row, column=col, value=value)
+    if key in ("spend", "purchase_value", "cpa", "cpc", "cpm"):
+        cell.number_format = currency_format
+    elif key in ("purchases", "impressions", "reach", "clicks", "landing_page_views"):
+        cell.number_format = '#,##0'
+    elif key == "roas":
+        cell.number_format = '0.00'
+    elif key == "ctr":
+        cell.number_format = '0.00"%"'
+    elif key in ("click_to_landing_page_rate", "landing_page_to_purchase_rate"):
+        cell.number_format = '0.0%'
+
+
+def build_trend_efficiency_sheet(wb: Workbook, df: pd.DataFrame, findings: dict):
+    ws = wb.create_sheet("Trend & Efficiency")
+    hide_gridlines(ws)
+    apply_print_settings(ws)
+    currency_code = findings.get("analysis_metadata", {}).get("account_currency")
+
+    row = add_sheet_title(ws, "Trend & Efficiency Analysis")
+    add_nav_bar(ws, "Trend & Efficiency", row=row)
+    add_back_link(ws, row=1, column=10)
+    row += 2
+
+    daily = aggregate_daily_metrics(df)
+    add_moving_averages(daily, MOVING_AVERAGE_KEYS)
+    weekly = aggregate_weekly_totals(df)
+
+    ws.cell(row=row, column=1, value="DAILY PERFORMANCE").font = SECTION_FONT
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(DAILY_TABLE_COLUMNS))
+    row += 1
+    daily_header_row = row
+    for i, (label, _) in enumerate(DAILY_TABLE_COLUMNS, start=1):
+        ws.cell(row=row, column=i, value=label)
+    style_header_row(ws, row, len(DAILY_TABLE_COLUMNS))
+    row += 1
+    daily_first_row = row
+    for entry in daily:
+        for i, (_, key) in enumerate(DAILY_TABLE_COLUMNS, start=1):
+            if key == "date":
+                ws.cell(row=row, column=i, value=entry["date"]).number_format = "YYYY-MM-DD"
+            else:
+                _write_metric_column(ws, row, i, key, entry.get(key), currency_code)
+        row += 1
+    daily_last_row = row - 1
+    row += 2
+
+    ws.cell(row=row, column=1, value="WEEKLY PERFORMANCE").font = SECTION_FONT
+    ws.cell(row=row, column=1).fill = HEADER_FILL
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=len(WEEKLY_TABLE_COLUMNS))
+    row += 1
+    for i, (label, _) in enumerate(WEEKLY_TABLE_COLUMNS, start=1):
+        ws.cell(row=row, column=i, value=label)
+    style_header_row(ws, row, len(WEEKLY_TABLE_COLUMNS))
+    row += 1
+    for entry in weekly:
+        for i, (_, key) in enumerate(WEEKLY_TABLE_COLUMNS, start=1):
+            if key == "week_start":
+                ws.cell(row=row, column=i, value=entry["week_start"])
+            else:
+                _write_metric_column(ws, row, i, key, entry.get(key), currency_code)
+        row += 1
+    row += 2
+
+    def daily_col(key: str) -> int:
+        return next(i for i, (_, k) in enumerate(DAILY_TABLE_COLUMNS, start=1) if k == key)
+
+    anchor_row = row
+    spacing = 20
+    if daily_last_row >= daily_first_row:
+        cats_ref = Reference(ws, min_col=daily_col("date"), min_row=daily_first_row, max_row=daily_last_row)
+
+        spend_sales_ref = Reference(
+            ws, min_col=daily_col("spend"), max_col=daily_col("purchase_value"),
+            min_row=daily_header_row, max_row=daily_last_row,
+        )
+        _add_line_chart(ws, "Daily Spend and Tracked Sales", "Amount", cats_ref, spend_sales_ref, f"A{anchor_row}", width=26, height=11)
+        anchor_row += spacing
+
+        # 7-day moving averages live in extra columns appended after the
+        # visible daily table -- still real worksheet cells, just off to the
+        # side, exactly like every other chart source block in this workbook.
+        ma_col_start = len(DAILY_TABLE_COLUMNS) + 2
+        ws.cell(row=daily_header_row, column=ma_col_start, value="ROAS (7D Avg)")
+        ws.cell(row=daily_header_row, column=ma_col_start + 1, value="CPA (7D Avg)")
+        style_header_row(ws, daily_header_row, 2, start_col=ma_col_start)
+        for offset, entry in enumerate(daily):
+            r = daily_first_row + offset
+            roas_avg = entry.get("roas_7d_avg")
+            cpa_avg = entry.get("cpa_7d_avg")
+            ws.cell(row=r, column=ma_col_start, value=roas_avg if roas_avg is not None else None).number_format = '0.00'
+            fmt = get_currency_excel_number_format(currency_code)
+            cpa_cell = ws.cell(row=r, column=ma_col_start + 1, value=cpa_avg if cpa_avg is not None else None)
+            cpa_cell.number_format = fmt
+
+        roas_ma_ref = Reference(ws, min_col=ma_col_start, max_col=ma_col_start, min_row=daily_header_row, max_row=daily_last_row)
+        _add_line_chart(ws, "7-Day ROAS Trend", "ROAS (7D Avg)", cats_ref, roas_ma_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+        cpa_ma_ref = Reference(ws, min_col=ma_col_start + 1, max_col=ma_col_start + 1, min_row=daily_header_row, max_row=daily_last_row)
+        _add_line_chart(ws, "7-Day CPA Trend", "CPA (7D Avg)", cats_ref, cpa_ma_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+
+        ctr_ref = Reference(ws, min_col=daily_col("ctr"), max_col=daily_col("ctr"), min_row=daily_header_row, max_row=daily_last_row)
+        _add_line_chart(ws, "CTR Trend", "CTR", cats_ref, ctr_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+        cpc_ref = Reference(ws, min_col=daily_col("cpc"), max_col=daily_col("cpc"), min_row=daily_header_row, max_row=daily_last_row)
+        _add_line_chart(ws, "CPC Trend", "CPC", cats_ref, cpc_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+        cpm_ref = Reference(ws, min_col=daily_col("cpm"), max_col=daily_col("cpm"), min_row=daily_header_row, max_row=daily_last_row)
+        _add_line_chart(ws, "CPM Trend", "CPM", cats_ref, cpm_ref, f"A{anchor_row}", single_series=True)
+        anchor_row += spacing
+
+        # LPV-derived trend charts only if LPV was genuinely collected --
+        # never plotted as a fake-zero series when unavailable.
+        if any(entry.get("landing_page_views") is not None for entry in daily):
+            lpv_ref = Reference(ws, min_col=daily_col("landing_page_views"), max_col=daily_col("landing_page_views"), min_row=daily_header_row, max_row=daily_last_row)
+            _add_line_chart(ws, "LPV Trend", "LPV", cats_ref, lpv_ref, f"A{anchor_row}", single_series=True)
+            anchor_row += spacing
+        if any(entry.get("landing_page_to_purchase_rate") is not None for entry in daily):
+            cvr_ref = Reference(
+                ws, min_col=daily_col("landing_page_to_purchase_rate"), max_col=daily_col("landing_page_to_purchase_rate"),
+                min_row=daily_header_row, max_row=daily_last_row,
+            )
+            _add_line_chart(ws, "Landing-to-Purchase CVR Trend", "CVR", cats_ref, cvr_ref, f"A{anchor_row}", single_series=True)
+
+    autosize_columns(ws, max_width=22)
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Sheet 6: AI Management Brief
+# ---------------------------------------------------------------------------
+
+REQUIRED_AI_BRIEF_SECTIONS = [
+    "EXECUTIVE VERDICT",
+    "WHAT MATERIALLY CHANGED",
+    "WHERE MONEY IS BEING WASTED",
+    "WHERE INCREMENTAL BUDGET SHOULD MOVE",
+    "GROWTH OPPORTUNITIES",
+    "FUNNEL & CONVERSION RISKS",
+    "TRACKING & MEASUREMENT RISKS",
+    "7-DAY ACTION PLAN",
+    "MANAGEMENT DECISIONS REQUIRED",
+]
+AI_BRIEF_SECTION_LABELS = {
+    "EXECUTIVE VERDICT": "Executive Verdict",
+    "WHAT MATERIALLY CHANGED": "What Materially Changed",
+    "WHERE MONEY IS BEING WASTED": "Where Money Is Being Wasted",
+    "WHERE INCREMENTAL BUDGET SHOULD MOVE": "Where Incremental Budget Should Move",
+    "GROWTH OPPORTUNITIES": "Growth Opportunities",
+    "FUNNEL & CONVERSION RISKS": "Funnel & Conversion Risks",
+    "TRACKING & MEASUREMENT RISKS": "Tracking & Measurement Risks",
+    "7-DAY ACTION PLAN": "7-Day Action Plan",
+    "MANAGEMENT DECISIONS REQUIRED": "Management Decisions Required",
+}
+ACTION_PLAN_SECTIONS = {"7-DAY ACTION PLAN"}
+DECISION_SECTIONS = {"MANAGEMENT DECISIONS REQUIRED"}
+ACTION_PLAN_FIELDS = ["Priority", "Action", "Campaign", "Evidence", "Expected Business Impact", "Confidence"]
+DECISION_FIELDS = ["Priority", "Decision", "Evidence", "Commercial Implication", "Confidence"]
+NO_CONTENT_FALLBACK = "No material evidence identified in the current deterministic findings."
+LEGACY_FORBIDDEN_PHRASE = "No content generated for this section"
+
+RECOMMENDATION_FIELD_PATTERN = re.compile(
+    r'^\**\s*(Priority|Action|Campaign|Evidence|Expected Business Impact|Decision|'
+    r'Commercial Implication|Confidence)\s*:\**\s*(.*)$',
+    re.IGNORECASE,
+)
+
+
+def parse_ai_report_sections(markdown_text: str) -> Dict[str, str]:
+    """Split Claude's markdown into an ordered dict of section name -> body text.
+
+    Matches on '## SECTION NAME' headings (case-insensitive) against the
+    required section list. Anything before the first recognized heading is
+    treated as part of the Executive Verdict so content is never dropped,
+    even if Claude's formatting drifts slightly from the requested structure.
+    """
+    sections: Dict[str, List[str]] = {name: [] for name in REQUIRED_AI_BRIEF_SECTIONS}
+    current = "EXECUTIVE VERDICT"
+
+    for line in markdown_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            heading_text = stripped.lstrip("#").strip().upper()
+            matched = next((name for name in REQUIRED_AI_BRIEF_SECTIONS if heading_text == name), None)
+            if matched:
+                current = matched
+                continue
+            if stripped.lstrip("#").strip().startswith("Meta Ads"):
+                continue
+        sections[current].append(line)
+
+    return {name: "\n".join(body_lines).strip() for name, body_lines in sections.items()}
+
+
+def parse_recommendation_blocks(section_text: str) -> List[Dict[str, str]]:
+    """Split one section's body into labeled recommendation/decision blocks.
+
+    Blocks are separated by blank lines. A block that doesn't match the
+    expected field structure is kept as free text rather than discarded, so
+    no content from Claude is ever lost.
+    """
+    if not section_text.strip():
+        return []
+
+    blocks: List[Dict[str, str]] = []
+    for raw_block in re.split(r"\n\s*\n", section_text.strip()):
+        fields: Dict[str, str] = {}
+        unmatched_lines: List[str] = []
+        for line in raw_block.splitlines():
+            match = RECOMMENDATION_FIELD_PATTERN.match(line.strip())
+            if match:
+                field_name = match.group(1).strip()
+                canonical = next(
+                    (f for f in (ACTION_PLAN_FIELDS + DECISION_FIELDS) if f.lower() == field_name.lower()),
+                    field_name,
+                )
+                fields[canonical] = match.group(2).strip()
+            elif line.strip():
+                unmatched_lines.append(line.strip())
+
+        if fields:
+            if unmatched_lines:
+                fields["_free_text"] = " ".join(unmatched_lines)
+            blocks.append(fields)
+        elif unmatched_lines:
+            blocks.append({"free_text": " ".join(unmatched_lines)})
+
+    return blocks
+
+
+def build_ai_management_brief_sheet(wb: Workbook, markdown_text: str) -> Dict[str, str]:
+    ws = wb.create_sheet("AI Management Brief")
+    hide_gridlines(ws)
+    apply_print_settings(ws, landscape=False)
+    sections = parse_ai_report_sections(markdown_text)
+
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 95
+
+    row = add_sheet_title(ws, "Meta Ads Performance Intelligence -- AI Management Brief", end_column=2)
+    add_nav_bar(ws, "AI Management Brief", row=row)
+    add_back_link(ws, row=1, column=4)
+    row += 2
+
+    for section_name in REQUIRED_AI_BRIEF_SECTIONS:
+        body = sections.get(section_name, "")
+        display_label = AI_BRIEF_SECTION_LABELS[section_name]
+
+        header_cell = ws.cell(row=row, column=1, value=display_label)
+        header_cell.font = SECTION_FONT
+        header_cell.fill = HEADER_FILL
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        ws.row_dimensions[row].height = 22
+        row += 1
+
+        if section_name == "EXECUTIVE VERDICT":
+            text = limit_words(body, 100) if body else NO_CONTENT_FALLBACK
+            cell = ws.cell(row=row, column=1, value=text)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+            ws.row_dimensions[row].height = 60
+            row += 2
+            continue
+
+        if not body:
+            ws.cell(row=row, column=1, value=NO_CONTENT_FALLBACK)
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+            row += 2
+            continue
+
+        if section_name in ACTION_PLAN_SECTIONS or section_name in DECISION_SECTIONS:
+            field_list = ACTION_PLAN_FIELDS if section_name in ACTION_PLAN_SECTIONS else DECISION_FIELDS
+            blocks = parse_recommendation_blocks(body)
+            max_rows = 5
+            blocks = blocks[:max_rows] if blocks else blocks
+            if not blocks:
+                cell = ws.cell(row=row, column=1, value=body)
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+                ws.row_dimensions[row].height = 60
+                row += 2
+                continue
+            for block in blocks:
+                if "free_text" in block:
+                    cell = ws.cell(row=row, column=1, value=block["free_text"])
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+                    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+                    ws.row_dimensions[row].height = 45
+                    row += 1
+                    continue
+                for field_name in field_list:
+                    label_cell = ws.cell(row=row, column=1, value=f"{field_name}:")
+                    label_cell.font = Font(bold=True)
+                    label_cell.alignment = Alignment(vertical="top")
+                    value_cell = ws.cell(row=row, column=2, value=block.get(field_name, ""))
+                    value_cell.alignment = Alignment(wrap_text=True, vertical="top")
+                    ws.row_dimensions[row].height = 32
+                    row += 1
+                row += 1  # blank separator between blocks
+        else:
+            cell = ws.cell(row=row, column=1, value=body)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+            approx_lines = max(1, body.count("\n") + len(body) // 90)
+            ws.row_dimensions[row].height = min(400, max(30, approx_lines * 15))
+            row += 2
+
+    ws.freeze_panes = "A1"
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# Sheet 7: Raw Data
 # ---------------------------------------------------------------------------
 
 def build_raw_data_sheet(wb: Workbook, df: pd.DataFrame, currency_code: Optional[str] = None):
@@ -346,10 +1467,10 @@ def build_raw_data_sheet(wb: Workbook, df: pd.DataFrame, currency_code: Optional
     ws.append(RAW_DATA_COLUMNS)
     style_header_row(ws, 1, len(RAW_DATA_COLUMNS))
 
-    for _, row in df.iterrows():
+    for _, row_data in df.iterrows():
         values = []
         for col in RAW_DATA_COLUMNS:
-            value = row[col]
+            value = row_data[col]
             if col in RAW_DATA_DATE_COLUMNS:
                 values.append(value)
             elif col in RAW_DATA_TEXT_COLUMNS:
@@ -383,493 +1504,8 @@ def build_raw_data_sheet(wb: Workbook, df: pd.DataFrame, currency_code: Optional
     table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
     ws.add_table(table)
 
+    add_back_link(ws, row=1, column=len(RAW_DATA_COLUMNS) + 2)
     autosize_columns(ws, max_width=24)
-    return ws
-
-
-# ---------------------------------------------------------------------------
-# Sheet 2: Executive Dashboard
-# ---------------------------------------------------------------------------
-
-def _kpi_number_format(format_type: str, currency_code: Optional[str]) -> str:
-    if format_type == "currency":
-        return get_currency_excel_number_format(currency_code)
-    return {
-        "integer": '#,##0',
-        "decimal": '0.00',
-        "true_fraction_percent": '0.0%',
-    }[format_type]
-
-
-def build_dashboard_header(ws, findings: dict) -> None:
-    meta = findings["analysis_metadata"]
-    confidence = findings["account_integrity"]["decision_confidence"]
-
-    ws.cell(row=1, column=1, value="Meta Ads Performance Intelligence -- Executive Dashboard")
-    ws.cell(row=1, column=1).font = Font(bold=True, size=16)
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4)
-
-    subtitle = (
-        f"Last 7 Days: {meta['last_7_day_window']['start']} to {meta['last_7_day_window']['end']}   |   "
-        f"Previous 7 Days: {meta['previous_7_day_window']['start']} to {meta['previous_7_day_window']['end']}   |   "
-        f"Account Decision Confidence: {confidence}"
-    )
-    ws.cell(row=2, column=1, value=subtitle)
-    ws.cell(row=2, column=1).font = Font(italic=True, size=10)
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=4)
-
-
-def build_kpi_table(ws, account_summary: dict, start_row: int, currency_code: Optional[str] = None) -> int:
-    last7 = account_summary["last_7_days"]
-    previous7 = account_summary["previous_7_days"]
-    changes = dict(account_summary["changes"])
-    # compute_changes() (performance_analyzer.py) intentionally covers only 9
-    # metrics -- it is not modified here. The 2 additional pct-changes the
-    # dashboard needs (purchase_value, cpm) are derived the same way, locally,
-    # using the same unmodified safe_pct_change() helper.
-    changes["purchase_value_pct_change"] = safe_pct_change(last7.get("purchase_value"), previous7.get("purchase_value"))
-    changes["cpm_pct_change"] = safe_pct_change(last7.get("cpm"), previous7.get("cpm"))
-
-    headers = ["Metric", "Current 7 Days", "Previous 7 Days", "% Change"]
-    for i, header in enumerate(headers, start=1):
-        ws.cell(row=start_row, column=i, value=header)
-    style_header_row(ws, start_row, len(headers))
-
-    for offset, (label, metric_key, change_key, format_type, direction) in enumerate(KPI_DEFINITIONS, start=1):
-        row = start_row + offset
-        fmt = _kpi_number_format(format_type, currency_code)
-
-        ws.cell(row=row, column=1, value=label)
-        current_cell = ws.cell(row=row, column=2, value=last7.get(metric_key))
-        previous_cell = ws.cell(row=row, column=3, value=previous7.get(metric_key))
-        change_cell = ws.cell(row=row, column=4, value=changes.get(change_key))
-        current_cell.number_format = fmt
-        previous_cell.number_format = fmt
-        change_cell.number_format = CHANGE_NUMBER_FORMAT
-
-        if direction == "positive_increase":
-            good_rule = CellIsRule(operator="greaterThan", formula=["0"], fill=GREEN_FILL)
-            bad_rule = CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL)
-        elif direction == "negative_increase":
-            good_rule = CellIsRule(operator="lessThan", formula=["0"], fill=GREEN_FILL)
-            bad_rule = CellIsRule(operator="greaterThan", formula=["0"], fill=RED_FILL)
-        else:
-            good_rule = bad_rule = None
-
-        if good_rule is not None:
-            ws.conditional_formatting.add(change_cell.coordinate, good_rule)
-            ws.conditional_formatting.add(change_cell.coordinate, bad_rule)
-
-    return start_row + len(KPI_DEFINITIONS)
-
-
-def build_chart_data_area(
-    ws,
-    start_row: int,
-    daily_totals: List[Dict[str, Any]],
-    account_last7: dict,
-    campaign_totals: List[Dict[str, Any]],
-    currency_code: Optional[str] = None,
-) -> Dict[str, int]:
-    """Write the deterministic chart source data into its own column block.
-
-    Every chart built from this workbook references these cells via
-    openpyxl Reference() objects -- nothing is hardcoded into a chart.
-    """
-    col = CALC_COL_OFFSET
-    row = start_row
-    currency_format = get_currency_excel_number_format(currency_code)
-
-    ws.cell(row=row, column=col, value="Chart Source Data (auto-generated -- do not edit)")
-    ws.cell(row=row, column=col).font = Font(bold=True, size=12)
-    row += 2
-
-    daily_header_row = row
-    for i, header in enumerate(["Date", "Spend", "Purchase Value", "ROAS", "CPA", "Purchases"]):
-        ws.cell(row=row, column=col + i, value=header)
-    style_header_row(ws, row, 6)
-    row += 1
-    daily_first_data_row = row
-    for entry in daily_totals:
-        ws.cell(row=row, column=col, value=entry["date"]).number_format = "YYYY-MM-DD"
-        ws.cell(row=row, column=col + 1, value=entry["spend"]).number_format = currency_format
-        ws.cell(row=row, column=col + 2, value=entry["purchase_value"]).number_format = currency_format
-        ws.cell(row=row, column=col + 3, value=entry["roas"]).number_format = '0.00'
-        ws.cell(row=row, column=col + 4, value=entry["cpa"]).number_format = currency_format
-        ws.cell(row=row, column=col + 5, value=entry["purchases"]).number_format = '#,##0'
-        row += 1
-    daily_last_data_row = row - 1
-    row += 2
-
-    ws.cell(row=row, column=col, value="Conversion Funnel (Last 7 Days)")
-    ws.cell(row=row, column=col).font = Font(bold=True, size=12)
-    row += 1
-    ws.cell(row=row, column=col, value="Stage")
-    ws.cell(row=row, column=col + 1, value="Count")
-    style_header_row(ws, row, 2)
-    funnel_header_row = row
-    row += 1
-    funnel_first_row = row
-    for label, value in (
-        ("Clicks", account_last7.get("clicks")),
-        ("Add to Cart", account_last7.get("add_to_carts")),
-        ("Initiated Checkout", account_last7.get("initiated_checkouts")),
-        ("Purchases", account_last7.get("purchases")),
-    ):
-        ws.cell(row=row, column=col, value=label)
-        ws.cell(row=row, column=col + 1, value=value).number_format = '#,##0'
-        row += 1
-    funnel_last_row = row - 1
-    row += 2
-
-    ws.cell(row=row, column=col, value="Top Campaigns by Purchase Value")
-    ws.cell(row=row, column=col).font = Font(bold=True, size=12)
-    row += 1
-    ws.cell(row=row, column=col, value="Campaign")
-    ws.cell(row=row, column=col + 1, value="Purchase Value")
-    style_header_row(ws, row, 2)
-    top_value_header_row = row
-    row += 1
-    top_value_first_row = row
-    top_by_value = sorted(campaign_totals, key=lambda c: (c["purchase_value"] or 0.0), reverse=True)[:10]
-    for entry in top_by_value:
-        ws.cell(row=row, column=col, value=entry["campaign_name"])
-        ws.cell(row=row, column=col + 1, value=entry["purchase_value"]).number_format = currency_format
-        row += 1
-    top_value_last_row = row - 1
-    row += 2
-
-    ws.cell(row=row, column=col, value="Top Campaigns by ROAS")
-    ws.cell(row=row, column=col).font = Font(bold=True, size=12)
-    row += 1
-    ws.cell(row=row, column=col, value="Campaign")
-    ws.cell(row=row, column=col + 1, value="ROAS")
-    style_header_row(ws, row, 2)
-    top_roas_header_row = row
-    row += 1
-    top_roas_first_row = row
-    ranked_by_roas = sorted(
-        (c for c in campaign_totals if c["roas"] is not None), key=lambda c: c["roas"], reverse=True
-    )[:10]
-    for entry in ranked_by_roas:
-        ws.cell(row=row, column=col, value=entry["campaign_name"])
-        ws.cell(row=row, column=col + 1, value=entry["roas"]).number_format = '0.00'
-        row += 1
-    top_roas_last_row = row - 1
-
-    return {
-        "daily_header_row": daily_header_row,
-        "daily_first_data_row": daily_first_data_row,
-        "daily_last_data_row": daily_last_data_row,
-        "funnel_header_row": funnel_header_row,
-        "funnel_first_row": funnel_first_row,
-        "funnel_last_row": funnel_last_row,
-        "top_value_header_row": top_value_header_row,
-        "top_value_first_row": top_value_first_row,
-        "top_value_last_row": top_value_last_row,
-        "top_roas_header_row": top_roas_header_row,
-        "top_roas_first_row": top_roas_first_row,
-        "top_roas_last_row": top_roas_last_row,
-    }
-
-
-def _add_line_chart(ws, title: str, y_title: str, data_col: int, layout: Dict[str, int], anchor: str) -> None:
-    min_row = layout["daily_first_data_row"]
-    max_row = layout["daily_last_data_row"]
-    if max_row < min_row:
-        return
-    chart = LineChart()
-    chart.title = title
-    chart.y_axis.title = y_title
-    chart.x_axis.title = "Date"
-    data_ref = Reference(ws, min_col=data_col, max_col=data_col, min_row=layout["daily_header_row"], max_row=max_row)
-    cats_ref = Reference(ws, min_col=CALC_COL_OFFSET, min_row=min_row, max_row=max_row)
-    chart.add_data(data_ref, titles_from_data=True)
-    chart.set_categories(cats_ref)
-    chart.width = 24
-    chart.height = 10
-    ws.add_chart(chart, anchor)
-
-
-def _add_spend_vs_revenue_chart(ws, layout: Dict[str, int], anchor: str) -> None:
-    min_row = layout["daily_first_data_row"]
-    max_row = layout["daily_last_data_row"]
-    if max_row < min_row:
-        return
-    chart = LineChart()
-    chart.title = "Daily Spend vs Purchase Value Trend"
-    chart.y_axis.title = "Amount"
-    chart.x_axis.title = "Date"
-    data_ref = Reference(
-        ws, min_col=CALC_COL_OFFSET + 1, max_col=CALC_COL_OFFSET + 2, min_row=layout["daily_header_row"], max_row=max_row
-    )
-    cats_ref = Reference(ws, min_col=CALC_COL_OFFSET, min_row=min_row, max_row=max_row)
-    chart.add_data(data_ref, titles_from_data=True)
-    chart.set_categories(cats_ref)
-    chart.width = 26
-    chart.height = 11
-    ws.add_chart(chart, anchor)
-
-
-def _add_bar_chart(
-    ws, title: str, x_title: str, name_col: int, value_col: int, header_row: int, first_row: int, last_row: int, anchor: str
-) -> None:
-    if last_row < first_row:
-        return
-    chart = BarChart()
-    chart.type = "bar"
-    chart.title = title
-    chart.x_axis.title = x_title
-    data_ref = Reference(ws, min_col=value_col, max_col=value_col, min_row=header_row, max_row=last_row)
-    cats_ref = Reference(ws, min_col=name_col, min_row=first_row, max_row=last_row)
-    chart.add_data(data_ref, titles_from_data=True)
-    chart.set_categories(cats_ref)
-    chart.width = 22
-    chart.height = 10
-    ws.add_chart(chart, anchor)
-
-
-def build_executive_dashboard_sheet(
-    wb: Workbook, findings: dict, daily_totals: List[Dict[str, Any]], campaign_totals: List[Dict[str, Any]]
-):
-    ws = wb.create_sheet("Executive Dashboard")
-    currency_code = findings.get("analysis_metadata", {}).get("account_currency")
-
-    build_dashboard_header(ws, findings)
-    build_kpi_table(ws, findings["account_summary"], start_row=4, currency_code=currency_code)
-
-    layout = build_chart_data_area(
-        ws, start_row=1, daily_totals=daily_totals,
-        account_last7=findings["account_summary"]["last_7_days"], campaign_totals=campaign_totals,
-        currency_code=currency_code,
-    )
-
-    anchor_row = CHARTS_START_ROW
-    _add_spend_vs_revenue_chart(ws, layout, f"A{anchor_row}")
-    anchor_row += CHART_ROW_SPACING
-    _add_line_chart(ws, "Daily ROAS Trend", "ROAS", CALC_COL_OFFSET + 3, layout, f"A{anchor_row}")
-    anchor_row += CHART_ROW_SPACING
-    _add_line_chart(ws, "Daily CPA Trend", "CPA", CALC_COL_OFFSET + 4, layout, f"A{anchor_row}")
-    anchor_row += CHART_ROW_SPACING
-    _add_line_chart(ws, "Daily Purchases Trend", "Purchases", CALC_COL_OFFSET + 5, layout, f"A{anchor_row}")
-    anchor_row += CHART_ROW_SPACING
-    _add_bar_chart(
-        ws, "Conversion Funnel (Last 7 Days)", "Count",
-        CALC_COL_OFFSET, CALC_COL_OFFSET + 1,
-        layout["funnel_header_row"], layout["funnel_first_row"], layout["funnel_last_row"],
-        f"A{anchor_row}",
-    )
-    anchor_row += CHART_ROW_SPACING
-    _add_bar_chart(
-        ws, "Top Campaigns by Purchase Value", "Purchase Value",
-        CALC_COL_OFFSET, CALC_COL_OFFSET + 1,
-        layout["top_value_header_row"], layout["top_value_first_row"], layout["top_value_last_row"],
-        f"A{anchor_row}",
-    )
-    anchor_row += CHART_ROW_SPACING
-    _add_bar_chart(
-        ws, "Top Campaigns by ROAS", "ROAS",
-        CALC_COL_OFFSET, CALC_COL_OFFSET + 1,
-        layout["top_roas_header_row"], layout["top_roas_first_row"], layout["top_roas_last_row"],
-        f"A{anchor_row}",
-    )
-
-    autosize_columns(ws, max_width=30)
-    return ws
-
-
-# ---------------------------------------------------------------------------
-# Sheet 3: Campaign Performance
-# ---------------------------------------------------------------------------
-
-def build_campaign_performance_sheet(wb: Workbook, campaign_totals: List[Dict[str, Any]], findings: dict):
-    ws = wb.create_sheet("Campaign Performance")
-    ws.append(CAMPAIGN_PERFORMANCE_COLUMNS)
-    style_header_row(ws, 1, len(CAMPAIGN_PERFORMANCE_COLUMNS))
-
-    currency_code = findings.get("analysis_metadata", {}).get("account_currency")
-    ai_status_by_campaign = {c["campaign_id"]: c["ai_status"] for c in findings.get("campaigns", [])}
-    sorted_totals = sorted(campaign_totals, key=lambda c: c["spend"], reverse=True)
-
-    for entry in sorted_totals:
-        ai_status = ai_status_by_campaign.get(entry["campaign_id"], "MONITOR")
-        ws.append(
-            [
-                entry["campaign_id"], entry["campaign_name"], entry["objective"],
-                entry["spend"], entry["impressions"], entry["clicks"],
-                entry["ctr"], entry["cpc"], entry["cpm"],
-                entry["purchases"], entry["purchase_value"], entry["cpa"], entry["roas"],
-                entry["add_to_carts"], entry["initiated_checkouts"], entry["checkout_to_purchase_rate"],
-                entry["frequency"], ai_status,
-            ]
-        )
-
-    last_row = ws.max_row
-    col_index = {name: idx + 1 for idx, name in enumerate(CAMPAIGN_PERFORMANCE_COLUMNS)}
-
-    for r in range(2, last_row + 1):
-        ws.cell(row=r, column=col_index["Campaign ID"]).number_format = "@"
-    for col_name, fmt in CAMPAIGN_PERFORMANCE_NUMBER_FORMATS.items():
-        c_idx = col_index[col_name]
-        for r in range(2, last_row + 1):
-            ws.cell(row=r, column=c_idx).number_format = fmt
-
-    currency_format = get_currency_excel_number_format(currency_code)
-    for col_name in CAMPAIGN_PERFORMANCE_CURRENCY_COLUMNS:
-        c_idx = col_index[col_name]
-        for r in range(2, last_row + 1):
-            ws.cell(row=r, column=c_idx).number_format = currency_format
-
-    ws.freeze_panes = "A2"
-    last_col_letter = get_column_letter(len(CAMPAIGN_PERFORMANCE_COLUMNS))
-    table = Table(displayName="CampaignPerformanceTable", ref=f"A1:{last_col_letter}{last_row}")
-    table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
-    ws.add_table(table)
-
-    if last_row >= 2:
-        roas_col_letter = get_column_letter(col_index["ROAS"])
-        roas_range = f"{roas_col_letter}2:{roas_col_letter}{last_row}"
-        ws.conditional_formatting.add(roas_range, CellIsRule(operator="greaterThanOrEqual", formula=["3"], fill=GREEN_FILL))
-        ws.conditional_formatting.add(roas_range, CellIsRule(operator="lessThan", formula=["1"], fill=RED_FILL))
-
-        status_col_letter = get_column_letter(col_index["AI Status"])
-        status_range = f"{status_col_letter}2:{status_col_letter}{last_row}"
-        for status, fill in AI_STATUS_FILLS.items():
-            ws.conditional_formatting.add(status_range, CellIsRule(operator="equal", formula=[f'"{status}"'], fill=fill))
-
-    autosize_columns(ws, max_width=26)
-    return ws
-
-
-# ---------------------------------------------------------------------------
-# Sheet 4: AI Analysis
-# ---------------------------------------------------------------------------
-
-def parse_ai_report_sections(markdown_text: str) -> Dict[str, str]:
-    """Split Claude's markdown into an ordered dict of section name -> body text.
-
-    Matches on '## SECTION NAME' headings (case-insensitive) against the
-    required section list. Anything before the first recognized heading is
-    treated as part of the Executive Summary so content is never dropped,
-    even if Claude's formatting drifts slightly from the requested structure.
-    """
-    sections: Dict[str, List[str]] = {name: [] for name in REQUIRED_AI_ANALYSIS_SECTIONS}
-    current = "EXECUTIVE SUMMARY"
-
-    for line in markdown_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            heading_text = stripped.lstrip("#").strip().upper()
-            matched = next((name for name in REQUIRED_AI_ANALYSIS_SECTIONS if heading_text == name), None)
-            if matched:
-                current = matched
-                continue
-            if stripped.lstrip("#").strip().startswith("Meta Ads Performance"):
-                continue
-        sections[current].append(line)
-
-    return {name: "\n".join(body_lines).strip() for name, body_lines in sections.items()}
-
-
-def parse_recommendation_blocks(section_text: str) -> List[Dict[str, str]]:
-    """Split one section's body into labeled recommendation blocks.
-
-    Blocks are separated by blank lines. A block that doesn't match the
-    expected Priority/Decision Confidence/... field structure is kept as
-    free text rather than discarded, so no content from Claude is ever lost.
-    """
-    if not section_text.strip():
-        return []
-
-    blocks: List[Dict[str, str]] = []
-    for raw_block in re.split(r"\n\s*\n", section_text.strip()):
-        fields: Dict[str, str] = {}
-        unmatched_lines: List[str] = []
-        for line in raw_block.splitlines():
-            match = RECOMMENDATION_FIELD_PATTERN.match(line.strip())
-            if match:
-                field_name = match.group(1).strip()
-                canonical = next(f for f in RECOMMENDATION_FIELDS if f.lower() == field_name.lower())
-                fields[canonical] = match.group(2).strip()
-            elif line.strip():
-                unmatched_lines.append(line.strip())
-
-        if fields:
-            for field_name in RECOMMENDATION_FIELDS:
-                fields.setdefault(field_name, "")
-            if unmatched_lines:
-                fields["Observation"] = (fields["Observation"] + " " + " ".join(unmatched_lines)).strip()
-            blocks.append(fields)
-        elif unmatched_lines:
-            blocks.append({"free_text": " ".join(unmatched_lines)})
-
-    return blocks
-
-
-def build_ai_analysis_sheet(wb: Workbook, markdown_text: str):
-    ws = wb.create_sheet("AI Analysis")
-    sections = parse_ai_report_sections(markdown_text)
-
-    ws.column_dimensions["A"].width = 22
-    ws.column_dimensions["B"].width = 95
-
-    row = 1
-    ws.cell(row=row, column=1, value="Meta Ads Performance Intelligence -- AI Analysis")
-    ws.cell(row=row, column=1).font = Font(bold=True, size=16)
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
-    row += 2
-
-    for section_name in REQUIRED_AI_ANALYSIS_SECTIONS:
-        body = sections.get(section_name, "")
-
-        header_cell = ws.cell(row=row, column=1, value=section_name)
-        header_cell.font = Font(bold=True, size=13, color="FFFFFF")
-        header_cell.fill = HEADER_FILL
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
-        ws.row_dimensions[row].height = 22
-        row += 1
-
-        if not body:
-            ws.cell(row=row, column=1, value="No content generated for this section.")
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
-            row += 2
-            continue
-
-        if section_name in ACTION_SECTIONS:
-            blocks = parse_recommendation_blocks(body)
-            if not blocks:
-                cell = ws.cell(row=row, column=1, value=body)
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
-                ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
-                ws.row_dimensions[row].height = 60
-                row += 2
-                continue
-            for block in blocks:
-                if "free_text" in block:
-                    cell = ws.cell(row=row, column=1, value=block["free_text"])
-                    cell.alignment = Alignment(wrap_text=True, vertical="top")
-                    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
-                    ws.row_dimensions[row].height = 45
-                    row += 1
-                    continue
-                for field_name in RECOMMENDATION_FIELDS:
-                    label_cell = ws.cell(row=row, column=1, value=f"{field_name}:")
-                    label_cell.font = Font(bold=True)
-                    label_cell.alignment = Alignment(vertical="top")
-                    value_cell = ws.cell(row=row, column=2, value=block.get(field_name, ""))
-                    value_cell.alignment = Alignment(wrap_text=True, vertical="top")
-                    ws.row_dimensions[row].height = 32
-                    row += 1
-                row += 1  # blank separator between recommendation blocks
-        else:
-            cell = ws.cell(row=row, column=1, value=body)
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
-            approx_lines = max(1, body.count("\n") + len(body) // 90)
-            ws.row_dimensions[row].height = min(400, max(30, approx_lines * 15))
-            row += 2
-
-    ws.freeze_panes = "A1"
     return ws
 
 
@@ -883,16 +1519,38 @@ def generate_workbook(csv_path: str, findings_path: str, report_path: str, outpu
     markdown_text = load_ai_report(report_path)
 
     campaign_totals = aggregate_campaign_totals(df)
-    daily_totals = aggregate_daily_totals(df)
+    period = get_collected_period(df)
+    account_totals = aggregate_window(df, period["min_date"], period["max_date"])
+    compute_campaign_shares(campaign_totals, account_totals)
+
+    daily_totals = [
+        {
+            "date": entry["date"],
+            "spend": entry["spend"],
+            "purchase_value": entry["purchase_value"],
+            "roas": entry["roas"],
+            "cpa": entry["cpa"],
+            "purchases": entry["purchases"],
+        }
+        for entry in aggregate_daily_metrics(df)
+    ]
     currency_code = findings.get("analysis_metadata", {}).get("account_currency")
 
     wb = Workbook()
     wb.remove(wb.active)
 
+    # AI Management Brief is built first (off-workbook parse) so its
+    # Executive Verdict section can also drive the Executive Cockpit sheet --
+    # both sheets read from the exact same parsed AI markdown.
+    ai_sections = parse_ai_report_sections(markdown_text)
+
+    build_executive_cockpit_sheet(wb, findings, daily_totals, campaign_totals, ai_sections)
+    build_collected_period_sheet(wb, df, findings, campaign_totals)
+    build_marketing_funnel_sheet(wb, findings)
+    build_campaign_portfolio_sheet(wb, campaign_totals, findings)
+    build_trend_efficiency_sheet(wb, df, findings)
+    build_ai_management_brief_sheet(wb, markdown_text)
     build_raw_data_sheet(wb, df, currency_code=currency_code)
-    build_executive_dashboard_sheet(wb, findings, daily_totals, campaign_totals)
-    build_campaign_performance_sheet(wb, campaign_totals, findings)
-    build_ai_analysis_sheet(wb, markdown_text)
 
     if list(wb.sheetnames) != REQUIRED_WORKSHEET_ORDER:
         raise ExcelReportError(

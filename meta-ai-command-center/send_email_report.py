@@ -3,11 +3,13 @@
 Email delivery for the Meta Ads Performance Intelligence workbook.
 
 Runs only after the Excel workbook has been generated and validated. Sends
-the workbook as an attachment via the Resend API. Every number in the email's
-executive snapshot is read directly from data/performance_findings.json --
-Claude is never asked to compute email metrics, and this script performs no
-calculations of its own beyond simple counting/formatting of already-computed
-values.
+the workbook as an attachment via the Resend API. Every number in the
+email's executive snapshot is read directly from data/performance_findings.json
+(management_signals and management_decisions are deterministic output from
+performance_analyzer.py) -- the only AI-authored text in the email is the
+Executive Verdict, taken verbatim (word-limited) from Claude's own markdown
+report. This script performs no calculations of its own beyond simple
+counting/formatting of already-computed values.
 
 Required environment variables:
     RESEND_API_KEY     -- GitHub Actions secret (never logged or printed)
@@ -23,8 +25,10 @@ import sys
 import resend
 
 from currency_utils import format_currency_text
+from excel_report import NO_CONTENT_FALLBACK, limit_words, parse_ai_report_sections
 
 DEFAULT_FINDINGS_PATH = os.path.join("data", "performance_findings.json")
+DEFAULT_REPORT_PATH = os.path.join("reports", "meta_performance_report.md")
 DEFAULT_ATTACHMENT_PATH = "meta_ads_performance_intelligence.xlsx"
 ATTACHMENT_FILENAME = "meta_ads_performance_intelligence.xlsx"
 
@@ -70,6 +74,23 @@ def load_findings(path: str) -> dict:
         raise EmailDeliveryError(f"Findings file '{path}' is not valid JSON: {exc}") from exc
 
 
+def load_ai_verdict(report_path: str) -> str:
+    """Best-effort read of the AI markdown report's Executive Verdict section.
+
+    Never raises -- if the report is missing or unreadable, the email falls
+    back to the same deterministic "no material evidence" wording used
+    everywhere else in the pipeline rather than fabricating a verdict.
+    """
+    try:
+        with open(report_path) as report_file:
+            markdown_text = report_file.read()
+    except FileNotFoundError:
+        return NO_CONTENT_FALLBACK
+    sections = parse_ai_report_sections(markdown_text)
+    verdict = sections.get("EXECUTIVE VERDICT", "").strip()
+    return limit_words(verdict, 100) if verdict else NO_CONTENT_FALLBACK
+
+
 def _fmt_ratio(value) -> str:
     return "N/A" if value is None else f"{value:.2f}"
 
@@ -81,45 +102,50 @@ def _fmt_count(value) -> str:
 def build_snapshot(findings: dict) -> dict:
     """Pull the email's executive snapshot from already-computed deterministic values.
 
-    No metric here is calculated by this script beyond simple counting of
-    findings by severity/category -- every number traces back to
-    performance_analyzer.py's output.
+    No metric here is calculated by this script -- every number traces back
+    to performance_analyzer.py's output. Website Landings (LPV) is read only
+    from last_7_days["landing_page_views"]; if that is null, it renders as
+    "N/A", never a fabricated zero and never clicks.
     """
+    meta = findings.get("analysis_metadata", {})
     last7 = findings.get("account_summary", {}).get("last_7_days", {})
-    all_findings = findings.get("findings", [])
-    currency_code = findings.get("analysis_metadata", {}).get("account_currency")
+    currency_code = meta.get("account_currency")
 
-    critical_issues_count = sum(1 for f in all_findings if f.get("severity") == "critical")
-    scaling_opportunities_count = sum(1 for f in all_findings if f.get("category") == "scaling_opportunity")
-    decision_confidence = findings.get("account_integrity", {}).get("decision_confidence", "N/A")
+    reporting_period = (
+        f"{meta.get('last_7_day_window', {}).get('start', 'N/A')} to "
+        f"{meta.get('last_7_day_window', {}).get('end', 'N/A')}"
+    )
 
     return {
+        "reporting_period": reporting_period,
         "total_spend": format_currency_text(last7.get("spend"), currency_code),
         "purchase_value": format_currency_text(last7.get("purchase_value"), currency_code),
         "purchases": _fmt_count(last7.get("purchases")),
         "roas": _fmt_ratio(last7.get("roas")),
         "cpa": format_currency_text(last7.get("cpa"), currency_code),
-        "critical_issues_count": str(critical_issues_count),
-        "scaling_opportunities_count": str(scaling_opportunities_count),
-        "decision_confidence": decision_confidence,
+        "website_landings": _fmt_count(last7.get("landing_page_views")),
+        "decision_confidence": findings.get("account_integrity", {}).get("decision_confidence", "N/A"),
     }
 
 
 def build_subject(findings: dict) -> str:
     report_date = findings.get("analysis_metadata", {}).get("analysis_end_date", "")
-    return f"Meta Ads Performance Report — {report_date}"
+    return f"Meta Ads Executive Performance Brief | {report_date}"
 
 
-def build_html_body(snapshot: dict) -> str:
+def build_html_body(snapshot: dict, verdict: str = "", signals=None, decisions=None) -> str:
+    signals = signals or []
+    decisions = decisions or []
+
     rows = [
-        ("Total Spend", snapshot["total_spend"]),
-        ("Purchase Value", snapshot["purchase_value"]),
-        ("Purchases", snapshot["purchases"]),
+        ("Reporting Period", snapshot["reporting_period"]),
+        ("Spend", snapshot["total_spend"]),
+        ("Tracked Sales", snapshot["purchase_value"]),
         ("ROAS", snapshot["roas"]),
+        ("Purchases", snapshot["purchases"]),
         ("CPA", snapshot["cpa"]),
-        ("Critical Issues Count", snapshot["critical_issues_count"]),
-        ("Scaling Opportunities Count", snapshot["scaling_opportunities_count"]),
-        ("Overall Decision Confidence", snapshot["decision_confidence"]),
+        ("Website Landings", snapshot["website_landings"]),
+        ("Decision Confidence", snapshot["decision_confidence"]),
     ]
     rows_html = "".join(
         f'<tr>'
@@ -128,14 +154,37 @@ def build_html_body(snapshot: dict) -> str:
         f'</tr>'
         for label, value in rows
     )
+
+    signals_html = "".join(
+        f'<li style="margin-bottom:8px;"><strong>{s.get("signal", "")}</strong> -- {s.get("business_implication", "")} '
+        f'<em>(Confidence: {s.get("confidence", "N/A")})</em></li>'
+        for s in signals[:3]
+    ) or f'<li>{NO_CONTENT_FALLBACK}</li>'
+
+    decisions_html = "".join(
+        f'<li style="margin-bottom:8px;"><strong>[{d.get("priority", "").upper()}]</strong> {d.get("decision", "")} '
+        f'<em>(Confidence: {d.get("confidence", "N/A")})</em></li>'
+        for d in decisions[:5]
+    ) or f'<li>{NO_CONTENT_FALLBACK}</li>'
+
     return f"""
 <html>
   <body style="font-family:Arial,sans-serif;color:#222;">
-    <h2 style="margin-bottom:4px;">Meta Ads Performance Intelligence -- Executive Snapshot</h2>
+    <h2 style="margin-bottom:4px;">Meta Ads Executive Performance Brief</h2>
     <table style="border-collapse:collapse;width:100%;max-width:480px;margin-top:12px;">
       {rows_html}
     </table>
-    <p style="margin-top:20px;">The complete Meta Ads Performance Intelligence workbook is attached.</p>
+
+    <h3 style="margin-top:24px;">Executive Verdict</h3>
+    <p>{verdict}</p>
+
+    <h3 style="margin-top:24px;">Top 3 Management Signals</h3>
+    <ul>{signals_html}</ul>
+
+    <h3 style="margin-top:24px;">Decisions Required This Week</h3>
+    <ul>{decisions_html}</ul>
+
+    <p style="margin-top:20px;">Full campaign portfolio, funnel analysis, trend analysis, AI management brief, and raw Meta data are attached in the Excel performance pack.</p>
   </body>
 </html>
 """.strip()
@@ -149,18 +198,23 @@ def build_attachment(workbook_path: str) -> dict:
     return {"filename": ATTACHMENT_FILENAME, "content": content}
 
 
-def send_report_email(config: dict, findings: dict, workbook_path: str) -> str:
+def send_report_email(config: dict, findings: dict, workbook_path: str, report_path: str = DEFAULT_REPORT_PATH) -> str:
     """Send the report email via Resend. Returns the sent email's ID.
 
     Never logs or prints config["api_key"].
     """
     resend.api_key = config["api_key"]
 
+    snapshot = build_snapshot(findings)
+    verdict = load_ai_verdict(report_path)
+    signals = findings.get("management_signals", [])
+    decisions = findings.get("management_decisions", [])
+
     params = {
         "from": config["from"],
         "to": [config["to"]],
         "subject": build_subject(findings),
-        "html": build_html_body(build_snapshot(findings)),
+        "html": build_html_body(snapshot, verdict, signals, decisions),
         "attachments": [build_attachment(workbook_path)],
     }
 
@@ -177,6 +231,7 @@ def send_report_email(config: dict, findings: dict, workbook_path: str) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Email the generated Meta Ads Excel report via Resend.")
     parser.add_argument("--findings", default=DEFAULT_FINDINGS_PATH, help="Path to performance_findings.json.")
+    parser.add_argument("--report", default=DEFAULT_REPORT_PATH, help="Path to meta_performance_report.md.")
     parser.add_argument("--workbook", default=DEFAULT_ATTACHMENT_PATH, help="Path to the Excel workbook to attach.")
     return parser.parse_args()
 
@@ -187,7 +242,7 @@ def main() -> None:
     try:
         config = load_config()
         findings = load_findings(args.findings)
-        email_id = send_report_email(config, findings, args.workbook)
+        email_id = send_report_email(config, findings, args.workbook, args.report)
     except EmailDeliveryError as exc:
         print(f"Email delivery error: {exc}")
         sys.exit(1)
