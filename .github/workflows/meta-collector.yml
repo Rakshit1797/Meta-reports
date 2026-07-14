@@ -43,7 +43,6 @@ jobs:
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-
           ARGS=()
 
           if [ -n "${{ inputs.since }}" ]; then
@@ -63,15 +62,26 @@ jobs:
             --metadata data/collection_metadata.json
 
       - name: Run deterministic performance analyzer
-        run: |
-          python performance_analyzer.py
+        run: python performance_analyzer.py
 
       - name: Run AI analyst
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
-        run: |
-          python ai_analyst.py
+        run: python ai_analyst.py
+
+      - name: Generate Excel report
+        run: python excel_report.py
+
+      - name: Validate Excel report
+        run: python validate_excel_report.py
+
+      - name: Send email report
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          REPORT_EMAIL_TO: ${{ vars.REPORT_EMAIL_TO }}
+          REPORT_EMAIL_FROM: ${{ vars.REPORT_EMAIL_FROM }}
+        run: python send_email_report.py
 
       - name: Upload CSV artifact
         if: always()
