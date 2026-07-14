@@ -12,7 +12,6 @@ on:
         required: false
         type: string
   schedule:
-    # Runs once a day at 06:00 UTC.
     - cron: "0 6 * * *"
 
 permissions:
@@ -25,6 +24,7 @@ defaults:
 jobs:
   collect:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -43,13 +43,17 @@ jobs:
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+
           ARGS=()
+
           if [ -n "${{ inputs.since }}" ]; then
             ARGS+=(--since "${{ inputs.since }}")
           fi
+
           if [ -n "${{ inputs.until }}" ]; then
             ARGS+=(--until "${{ inputs.until }}")
           fi
+
           python meta_collector.py "${ARGS[@]}"
 
       - name: Validate collected data
@@ -58,11 +62,33 @@ jobs:
             --csv data/meta_campaign_daily.csv \
             --metadata data/collection_metadata.json
 
+      - name: Run deterministic performance analyzer
+        run: |
+          python performance_analyzer.py
+
+      - name: Run AI analyst
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+        run: |
+          python ai_analyst.py
+
       - name: Upload CSV artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: meta-campaign-daily-${{ github.run_id }}
           path: meta-ai-command-center/data/meta_campaign_daily.csv
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload analysis artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meta-performance-analysis-${{ github.run_id }}
+          path: |
+            meta-ai-command-center/data/performance_findings.json
+            meta-ai-command-center/reports/
           retention-days: 90
           if-no-files-found: warn
